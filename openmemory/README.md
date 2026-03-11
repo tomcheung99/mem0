@@ -67,6 +67,9 @@ You can do this in one of the following ways:
 ```env
 OPENAI_API_KEY=sk-xxx
 USER=<user-id> # The User Id you want to associate the memories with 
+ALLOWED_ORIGINS=http://localhost:3000 # Comma-separated origins. Use * only for local development.
+MCP_API_KEY=change-me # Optional. When set, MCP endpoints require Bearer auth.
+MCP_RATE_LIMIT=100/minute
 ```
 - #### Example `/ui/.env`
 
@@ -105,6 +108,79 @@ npx @openmemory/install local http://localhost:8765/mcp/<client-name>/sse/<user-
 ```
 
 Replace `<client-name>` with the desired client name and `<user-id>` with the value specified in your environment variables.
+
+### Securing Remote MCP Access
+
+OpenMemory already isolates memory by user ID and app-level permissions. For an internet-exposed deployment, you should also enable transport-level controls:
+
+- Set `MCP_API_KEY` to require authentication on MCP SSE and message endpoints.
+- Set `ALLOWED_ORIGINS` to a comma-separated allowlist instead of `*`.
+- Tune `MCP_RATE_LIMIT` if you expect higher per-user throughput.
+
+Bearer auth is the preferred mode:
+
+```http
+Authorization: Bearer <MCP_API_KEY>
+```
+
+For clients that cannot set an Authorization header on SSE, the server also accepts `X-API-Key` or an `api_key` query parameter.
+
+### Railway Deployment
+
+An example Railway service manifest is available in [openmemory/railway.yaml](railway.yaml). It is aligned with the variables that the current backend actually reads:
+
+- `DATABASE_URL` for the relational metadata database.
+- `PG_HOST`, `PG_PORT`, `PG_DB`, `PG_USER`, `PG_PASSWORD` for pgvector.
+- `OPENAI_API_KEY`, `USER`, `MCP_API_KEY`, `ALLOWED_ORIGINS`, `MCP_RATE_LIMIT` for application runtime.
+
+The service also exposes a `/health` endpoint for Railway health checks.
+
+### MCP Client Examples
+
+VANE:
+
+```json
+{
+  "mcpServers": {
+    "mem0-memory": {
+      "command": "npx",
+      "args": [
+        "@openmemory/install",
+        "remote",
+        "https://your-app.railway.app/mcp/vane/sse/${USER_ID}",
+        "--client",
+        "vane"
+      ],
+      "env": {
+        "MCP_API_KEY": "${MEM0_MCP_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+OpenClaw:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "openclaw-mem0": {
+        "enabled": true,
+        "config": {
+          "mode": "open-source",
+          "userId": "${USER_ID}",
+          "apiKey": "${MEM0_MCP_API_KEY}",
+          "baseUrl": "https://your-app.railway.app",
+          "autoRecall": true,
+          "autoCapture": true,
+          "topK": 5
+        }
+      }
+    }
+  }
+}
+```
 
 
 ## Project Structure

@@ -18,12 +18,24 @@ make env
 
 Once you run this command, edit the file `api/.env` and enter the `OPENAI_API_KEY`.
 
+Example:
+
+```env
+OPENAI_API_KEY=sk-xxx
+USER=<user-id>
+ALLOWED_ORIGINS=http://localhost:3000
+MCP_API_KEY=
+MCP_RATE_LIMIT=100/minute
+```
+
 3. Start the services:
 ```bash
 make up
 ```
 
 The API will be available at `http://localhost:8765`
+
+The service also exposes a health check at `http://localhost:8765/health`.
 
 ### Common Docker Commands
 
@@ -58,3 +70,10 @@ Once the server is running, you can access the API documentation at:
 - Write tests for new features
 - Update documentation when making changes
 - Run migrations for database changes
+
+## Production Notes
+
+- `MCP_API_KEY` enables authentication for MCP SSE and message endpoints.
+- `ALLOWED_ORIGINS` should be restricted to trusted domains in production.
+- `MCP_RATE_LIMIT` applies per user ID on the SSE connection endpoint.
+- For Railway deployments using pgvector, use the environment variable names from [../railway.yaml](../railway.yaml).

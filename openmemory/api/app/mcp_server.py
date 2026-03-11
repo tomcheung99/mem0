@@ -21,16 +21,21 @@ import json
 import logging
 import uuid
 
+from app.config import MCP_API_KEY, MCP_RATE_LIMIT
 from app.database import SessionLocal
 from app.models import Memory, MemoryAccessLog, MemoryState, MemoryStatusHistory
 from app.utils.db import get_user_and_app
 from app.utils.memory import get_memory_client
 from app.utils.permissions import check_memory_access_permissions
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
 from fastapi.routing import APIRouter
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 # Load environment variables
 load_dotenv()
@@ -50,6 +55,43 @@ def get_memory_client_safe():
 # Context variables for user_id and client_name
 user_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("user_id")
 client_name_var: contextvars.ContextVar[str] = contextvars.ContextVar("client_name")
+
+security = HTTPBearer(auto_error=False)
+
+
+def get_rate_limit_key(request: Request) -> str:
+    uid = request.path_params.get("user_id") or user_id_var.get(None)
+    if uid:
+        return uid
+
+    if request.client and request.client.host:
+        return request.client.host
+
+    return "anonymous"
+
+
+limiter = Limiter(key_func=get_rate_limit_key)
+
+
+async def verify_api_key(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Security(security),
+) -> None:
+    if not MCP_API_KEY:
+        return
+
+    provided_key = None
+    if credentials and credentials.scheme.lower() == "bearer":
+        provided_key = credentials.credentials
+
+    if not provided_key:
+        provided_key = request.headers.get("x-api-key") or request.query_params.get("api_key")
+
+    if provided_key != MCP_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API Key",
+        )
 
 # Create a router for MCP endpoints
 mcp_router = APIRouter(prefix="/mcp")
@@ -428,7 +470,8 @@ async def delete_all_memories() -> str:
 
 
 @mcp_router.get("/{client_name}/sse/{user_id}")
-async def handle_sse(request: Request):
+@limiter.limit(MCP_RATE_LIMIT)
+async def handle_sse(request: Request, _: None = Depends(verify_api_key)):
     """Handle SSE connections for a specific user and client"""
     # Extract user_id and client_name from path parameters
     uid = request.path_params.get("user_id")
@@ -455,15 +498,16 @@ async def handle_sse(request: Request):
 
 
 @mcp_router.post("/messages/")
-async def handle_get_message(request: Request):
-    return await handle_post_message(request)
+async def handle_get_message(request: Request, _: None = Depends(verify_api_key)):
+    return await process_post_message(request)
 
 
 @mcp_router.post("/{client_name}/sse/{user_id}/messages/")
-async def handle_post_message(request: Request):
-    return await handle_post_message(request)
+async def handle_client_message(request: Request, _: None = Depends(verify_api_key)):
+    return await process_post_message(request)
 
-async def handle_post_message(request: Request):
+
+async def process_post_message(request: Request):
     """Handle POST messages for SSE"""
     try:
         body = await request.body()
@@ -487,6 +531,9 @@ async def handle_post_message(request: Request):
 def setup_mcp_server(app: FastAPI):
     """Setup MCP server with the FastAPI application"""
     mcp._mcp_server.name = "mem0-mcp-server"
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
 
     # Include MCP router in the FastAPI app
     app.include_router(mcp_router)

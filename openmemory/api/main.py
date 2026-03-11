@@ -1,7 +1,7 @@
 import datetime
 from uuid import uuid4
 
-from app.config import DEFAULT_APP_ID, USER_ID
+from app.config import ALLOWED_ORIGINS, ALLOW_CREDENTIALS, DEFAULT_APP_ID, USER_ID
 from app.database import Base, SessionLocal, engine
 from app.mcp_server import setup_mcp_server
 from app.models import App, User
@@ -14,8 +14,8 @@ app = FastAPI(title="OpenMemory API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -74,6 +74,11 @@ def create_default_app():
 # Create default user on startup
 create_default_user()
 create_default_app()
+
+
+@app.get("/health")
+async def healthcheck():
+    return {"status": "ok"}
 
 # Setup MCP server
 setup_mcp_server(app)

@@ -1,0 +1,25 @@
+services:
+  openmemory-mcp:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    env:
+      OPENAI_API_KEY: ${AI_GATEWAY_API_KEY}
+      OPENAI_BASE_URL: ${AI_GATEWAY_BASE_URL}
+      USER: ${DEFAULT_USER_ID}
+      DATABASE_URL: ${DATABASE_URL}
+      PG_HOST: ${PG_HOST}
+      PG_PORT: ${PG_PORT}
+      PG_DB: ${PG_DB}
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      MCP_API_KEY: ${MCP_API_KEY}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      MCP_RATE_LIMIT: ${MCP_RATE_LIMIT}
+    ports:
+      - "8765:8765"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

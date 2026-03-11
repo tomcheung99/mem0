@@ -5,12 +5,16 @@ services:
       - "6333:6333"
     volumes:
       - mem0_storage:/mem0/storage
+
   openmemory-mcp:
     image: mem0/openmemory-mcp
     build: api/
     environment:
+      - OPENAI_API_KEY
       - USER
-      - API_KEY
+      - ALLOWED_ORIGINS
+      - MCP_API_KEY
+      - MCP_RATE_LIMIT
     env_file:
       - api/.env
     depends_on:
@@ -21,6 +25,12 @@ services:
       - ./api:/usr/src/openmemory
     command: >
       sh -c "uvicorn main:app --host 0.0.0.0 --port 8765 --reload --workers 4"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   openmemory-ui:
     build:
       context: ui/
