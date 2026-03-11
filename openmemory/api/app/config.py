@@ -1,12 +1,26 @@
 import os
 
 
+def _normalize_openai_environment() -> None:
+    gateway_api_key = os.getenv("AI_GATEWAY_API_KEY", "").strip()
+    gateway_base_url = os.getenv("AI_GATEWAY_BASE_URL", "").strip()
+
+    if gateway_api_key and not os.getenv("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = gateway_api_key
+
+    if gateway_base_url and not os.getenv("OPENAI_BASE_URL"):
+        os.environ["OPENAI_BASE_URL"] = gateway_base_url
+
+
 def _parse_allowed_origins(value: str | None) -> list[str]:
     if not value:
         return ["*"]
 
     origins = [origin.strip() for origin in value.split(",") if origin.strip()]
     return origins or ["*"]
+
+
+_normalize_openai_environment()
 
 
 USER_ID = os.getenv("USER", "default_user")

@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import List
 
 from app.utils.prompts import MEMORY_CATEGORIZATION_PROMPT
@@ -8,7 +9,20 @@ from pydantic import BaseModel
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 load_dotenv()
-openai_client = OpenAI()
+
+
+def get_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("AI_GATEWAY_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("AI_GATEWAY_BASE_URL")
+
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY or AI_GATEWAY_API_KEY must be set for memory categorization")
+
+    client_kwargs = {"api_key": api_key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+
+    return OpenAI(**client_kwargs)
 
 
 class MemoryCategories(BaseModel):
@@ -18,6 +32,7 @@ class MemoryCategories(BaseModel):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=15))
 def get_categories_for_memory(memory: str) -> List[str]:
     try:
+        openai_client = get_openai_client()
         messages = [
             {"role": "system", "content": MEMORY_CATEGORIZATION_PROMPT},
             {"role": "user", "content": memory}
