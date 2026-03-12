@@ -35,7 +35,6 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
 
 # Load environment variables
 load_dotenv()
@@ -533,7 +532,6 @@ def setup_mcp_server(app: FastAPI):
     mcp._mcp_server.name = "mem0-mcp-server"
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-    app.add_middleware(SlowAPIMiddleware)
 
     # Include MCP router in the FastAPI app
     app.include_router(mcp_router)
