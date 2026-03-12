@@ -1,3 +1,4 @@
+import patch_mem0  # must be first — patches mem0's OpenAI LLM before any usage
 import asyncio
 import datetime
 import logging

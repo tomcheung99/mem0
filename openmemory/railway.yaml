@@ -1,8 +1,8 @@
 services:
   openmemory-mcp:
     build:
-      context: ..
-      dockerfile: openmemory/api/Dockerfile
+      context: ./api
+      dockerfile: Dockerfile
     env:
       OPENAI_API_KEY: ${AI_GATEWAY_API_KEY}
       OPENAI_BASE_URL: ${AI_GATEWAY_BASE_URL}
