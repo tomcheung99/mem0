@@ -182,17 +182,26 @@ def get_default_memory_config():
         }
     elif pg_host and pg_port:
         vector_store_provider = "pgvector"
-        vector_store_config.update({
-            "host": pg_host,
-            "port": int(pg_port),
-            "dbname": pg_db,
-            "user": pg_user,
-            "password": pg_password,
-            "embedding_model_dims": 1536,
-            "diskann": False,
-        })
+        # Debug logging for connection parameters
+        logging.info(
+            "PGVector config - host=%s port=%s dbname=%s user=%s password_set=%s",
+            pg_host, pg_port, pg_db, pg_user, bool(pg_password)
+        )
+        # Build connection string directly for better control
+        from urllib.parse import quote_plus
+        safe_password = quote_plus(pg_password) if pg_password else ""
+        safe_user = quote_plus(pg_user) if pg_user else ""
+        connection_string = f"postgresql://{safe_user}:{safe_password}@{pg_host}:{pg_port}/{pg_db}"
         if pg_sslmode:
-            vector_store_config["sslmode"] = pg_sslmode
+            connection_string += f"?sslmode={pg_sslmode}"
+        logging.info("PGVector connection_string (without password): postgresql://%s:***@%s:%s/%s",
+                     pg_user, pg_host, pg_port, pg_db)
+        vector_store_config.update({
+            "connection_string": connection_string,
+            "embedding_model_dims": 1536,
+            "minconn": 1,
+            "maxconn": 2,  # Reduced for Railway compatibility
+        })
     elif os.environ.get('MILVUS_HOST') and os.environ.get('MILVUS_PORT'):
         vector_store_provider = "milvus"
         # Construct the full URL as expected by MilvusDBConfig
@@ -402,6 +411,10 @@ def get_memory_client(custom_instructions: str = None):
             print(f"Initializing memory client with config hash: {current_config_hash}")
             try:
                 logging.info("Creating new memory client instance")
+                # Debug: print vector store config
+                vs_config = config.get("vector_store", {})
+                logging.info("Vector store provider: %s", vs_config.get("provider"))
+                logging.info("Vector store config keys: %s", list(vs_config.get("config", {}).keys()))
                 _memory_client = Memory.from_config(config_dict=config)
                 _config_hash = current_config_hash
                 print("Memory client initialized successfully")
