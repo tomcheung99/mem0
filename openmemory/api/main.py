@@ -12,6 +12,7 @@ from app.routers import apps_router, backup_router, config_router, memories_rout
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi_pagination import add_pagination
+from sqlalchemy import text
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -85,6 +86,12 @@ def create_default_app():
 
 def initialize_database_state():
     logging.info("Initializing database state")
+
+    set_database_state(False, None, status="initializing", stage="db-connectivity-check")
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
+
+    logging.info("Database connectivity verified")
     set_database_state(False, None, status="initializing", stage="create-tables")
     Base.metadata.create_all(bind=engine)
 

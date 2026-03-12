@@ -20,7 +20,10 @@ engine_kwargs = {}
 if DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 elif DATABASE_URL.startswith("postgresql"):
-    engine_kwargs["connect_args"] = {"connect_timeout": 5}
+    engine_kwargs["connect_args"] = {
+        "connect_timeout": 5,
+        "options": "-c lock_timeout=5000 -c statement_timeout=10000",
+    }
     engine_kwargs["pool_pre_ping"] = True
 
 # SQLAlchemy engine & session
