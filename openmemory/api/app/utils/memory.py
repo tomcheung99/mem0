@@ -397,10 +397,15 @@ def get_memory_client(custom_instructions: str = None):
                 database_init_error,
             )
 
-        # Use custom_instructions parameter first, then fall back to database value
+        # Use custom_instructions parameter first, then fall back to database value,
+        # then fall back to the built-in domain-aware prompt.
         instructions_to_use = custom_instructions or db_custom_instructions
         if instructions_to_use:
             config["custom_fact_extraction_prompt"] = instructions_to_use
+        elif "custom_fact_extraction_prompt" not in config:
+            # Load the built-in multi-domain extraction prompt
+            from app.custom_prompts import CUSTOM_FACT_EXTRACTION_PROMPT
+            config["custom_fact_extraction_prompt"] = CUSTOM_FACT_EXTRACTION_PROMPT
 
         # ALWAYS parse environment variables in the final config
         # This ensures that even default config values like "env:OPENAI_API_KEY" get parsed

@@ -211,7 +211,8 @@ async def get_categories(
 
 class CreateMemoryRequest(BaseModel):
     user_id: str
-    text: str
+    text: Optional[str] = None
+    messages: Optional[List[dict]] = None
     metadata: dict = {}
     infer: bool = True
     app: str = "openmemory"
@@ -239,6 +240,14 @@ async def create_memory(
     if not app_obj.is_active:
         raise HTTPException(status_code=403, detail=f"App {request.app} is currently paused on OpenMemory. Cannot create new memories.")
 
+    # Resolve input: messages take priority over text
+    if request.messages:
+        mem0_input = request.messages
+    elif request.text:
+        mem0_input = request.text
+    else:
+        raise HTTPException(status_code=422, detail="Either 'text' or 'messages' must be provided.")
+
     # Log what we're about to do
     logging.info(f"Creating memory for user_id: {request.user_id} with app: {request.app}")
     
@@ -254,15 +263,19 @@ async def create_memory(
             "error": str(client_error)
         }
 
+    # Merge user metadata with source tracking metadata, user metadata takes priority
+    merged_metadata = {
+        "source_app": "openmemory",
+        "mcp_client": request.app,
+        **request.metadata,
+    }
+
     # Try to save to Qdrant via memory_client
     try:
         qdrant_response = memory_client.add(
-            request.text,
+            mem0_input,
             user_id=request.user_id,  # Use string user_id to match search
-            metadata={
-                "source_app": "openmemory",
-                "mcp_client": request.app,
-            },
+            metadata=merged_metadata,
             infer=request.infer
         )
         
@@ -532,10 +545,70 @@ async def update_memory(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     memory = get_memory_or_404(db, memory_id)
+
+    # --- Sync to vector store (re-embed + history) ---
+    try:
+        memory_client = get_memory_client()
+        if memory_client:
+            memory_client.update(str(memory_id), request.memory_content)
+    except Exception as e:
+        logging.warning(f"Vector store update failed for {memory_id}, SQL will still update: {e}")
+
     memory.content = request.memory_content
     db.commit()
     db.refresh(memory)
     return memory
+
+
+class SemanticSearchRequest(BaseModel):
+    user_id: str
+    query: str
+    limit: int = 10
+    metadata_filter: Optional[dict] = None
+
+
+@router.post("/search")
+async def search_memories(
+    request: SemanticSearchRequest,
+    db: Session = Depends(get_db)
+):
+    """Semantic search over memories using the vector store."""
+    user = db.query(User).filter(User.user_id == request.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        memory_client = get_memory_client()
+        if not memory_client:
+            raise Exception("Memory client is not available")
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    try:
+        search_kwargs = dict(
+            query=request.query,
+            user_id=request.user_id,
+            limit=request.limit,
+        )
+        results = memory_client.search(**search_kwargs)
+
+        # Optionally filter by metadata on the returned results
+        if request.metadata_filter:
+            filtered = []
+            for r in results.get("results", results) if isinstance(results, dict) else results:
+                meta = r.get("metadata", {})
+                if all(meta.get(k) == v for k, v in request.metadata_filter.items()):
+                    filtered.append(r)
+            if isinstance(results, dict):
+                results["results"] = filtered
+            else:
+                results = filtered
+
+        return results
+    except Exception as e:
+        logging.exception(f"Semantic search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 class FilterMemoriesRequest(BaseModel):
     user_id: str

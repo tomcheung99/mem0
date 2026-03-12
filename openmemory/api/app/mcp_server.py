@@ -99,7 +99,7 @@ mcp_router = APIRouter(prefix="/mcp")
 sse = SseServerTransport("/mcp/messages/")
 
 @mcp.tool(description="Add a new memory. This method is called everytime the user informs anything about themselves, their preferences, or anything that has any relevant information which can be useful in the future conversation. This can also be called when the user asks you to remember something.")
-async def add_memories(text: str) -> str:
+async def add_memories(text: str, metadata: dict | None = None) -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
     logging.info("MCP add_memories called user_id=%s client_name=%s", uid, client_name)
@@ -125,12 +125,16 @@ async def add_memories(text: str) -> str:
             if not app.is_active:
                 return f"Error: App {app.name} is currently paused on OpenMemory. Cannot create new memories."
 
+            # Merge user metadata with source tracking metadata
+            merged_metadata = {
+                "source_app": "openmemory",
+                "mcp_client": client_name,
+                **(metadata or {}),
+            }
+
             response = memory_client.add(text,
                                          user_id=uid,
-                                         metadata={
-                                            "source_app": "openmemory",
-                                            "mcp_client": client_name,
-                                        })
+                                         metadata=merged_metadata)
 
             # Process the response and update database
             if isinstance(response, dict) and 'results' in response:
@@ -145,6 +149,7 @@ async def add_memories(text: str) -> str:
                                 user_id=user.id,
                                 app_id=app.id,
                                 content=result['memory'],
+                                metadata_=metadata or {},
                                 state=MemoryState.active
                             )
                             db.add(memory)
@@ -160,6 +165,12 @@ async def add_memories(text: str) -> str:
                             new_state=MemoryState.active
                         )
                         db.add(history)
+
+                    elif result['event'] == 'UPDATE':
+                        if memory:
+                            memory.content = result['memory']
+                            if metadata:
+                                memory.metadata_ = {**(memory.metadata_ or {}), **metadata}
 
                     elif result['event'] == 'DELETE':
                         if memory:
@@ -409,6 +420,73 @@ async def delete_memories(memory_ids: list[str]) -> str:
     except Exception as e:
         logging.exception(f"Error deleting memories: {e}")
         return f"Error deleting memories: {e}"
+
+
+@mcp.tool()
+def update_memory(memory_id: str, new_content: str) -> str:
+    """Update an existing memory's content. Re-embeds in vector store and syncs SQL.
+
+    Args:
+        memory_id: The UUID of the memory to update.
+        new_content: The new content/text for this memory.
+    """
+    try:
+        # Validate UUID format
+        try:
+            parsed_id = uuid.UUID(memory_id)
+        except ValueError:
+            return f"Invalid memory_id format: {memory_id}"
+
+        user_id = user_id_var.get("")
+        client_name = client_name_var.get("")
+        if not user_id:
+            return "Error: user_id not found in context"
+
+        db = SessionLocal()
+        try:
+            user, app = get_user_and_app(db, user_id, client_name)
+
+            # Find memory and check ownership
+            memory = db.query(Memory).filter(
+                Memory.id == parsed_id,
+                Memory.state == MemoryState.active
+            ).first()
+            if not memory:
+                return f"Memory {memory_id} not found or already deleted"
+
+            # ACL check
+            has_access = check_memory_access_permissions(db, memory, app)
+            if not has_access:
+                return f"App '{client_name}' does not have permission to update memory {memory_id}"
+
+            old_content = memory.content
+
+            # Sync to vector store (re-embed + history)
+            memory_client = get_memory_client_safe()
+            if memory_client:
+                memory_client.update(str(parsed_id), new_content)
+
+            # Update SQL
+            memory.content = new_content
+            memory.updated_at = datetime.datetime.now(datetime.UTC)
+            db.commit()
+
+            # Access log
+            access_log = MemoryAccessLog(
+                memory_id=parsed_id,
+                app_id=app.id,
+                access_type="update",
+                metadata_={"old_content": old_content, "new_content": new_content}
+            )
+            db.add(access_log)
+            db.commit()
+
+            return f"Memory {memory_id} updated successfully"
+        finally:
+            db.close()
+    except Exception as e:
+        logging.exception(f"Error updating memory: {e}")
+        return f"Error updating memory: {e}"
 
 
 @mcp_router.get("/{client_name}/sse/{user_id}")

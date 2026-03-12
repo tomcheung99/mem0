@@ -20,7 +20,7 @@ def apply():
             except Exception as e:
                 err = str(e).lower()
                 if "response_format" in err or ("invalid" in err and "input" in err):
-                    logging.warning(
+                    logging.debug(
                         "mem0 patch: response_format rejected by endpoint, retrying without it: %s", e
                     )
                     return _orig(self, messages, response_format=None,
