@@ -135,7 +135,19 @@ class OpenAILLM(LLMBase):
         if tools:  # TODO: Remove tools if no issues found with new memory addition logic
             params["tools"] = tools
             params["tool_choice"] = tool_choice
-        response = self.client.chat.completions.create(**params)
+        try:
+            response = self.client.chat.completions.create(**params)
+        except Exception as e:
+            # Some gateways/proxies don't support response_format — retry without it
+            err_str = str(e).lower()
+            if "response_format" in err_str or ("invalid" in err_str and "input" in err_str):
+                logging.warning(
+                    "response_format rejected by endpoint, retrying without it: %s", e
+                )
+                params.pop("response_format", None)
+                response = self.client.chat.completions.create(**params)
+            else:
+                raise
         parsed_response = self._parse_response(response, tools)
         if self.config.response_callback:
             try:

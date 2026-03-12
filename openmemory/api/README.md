@@ -77,3 +77,5 @@ Once the server is running, you can access the API documentation at:
 - `ALLOWED_ORIGINS` should be restricted to trusted domains in production.
 - `MCP_RATE_LIMIT` applies per user ID on the SSE connection endpoint.
 - For Railway deployments using pgvector, use the environment variable names from [.env.example](.env.example) or Railway-native PostgreSQL variables such as `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, and `PGPASSWORD`.
+- `postgres.railway.internal` only works when the API service and PostgreSQL service are in the same Railway project and environment. If they are in different Railway projects, use the public proxy host from `DATABASE_PUBLIC_URL` or `RAILWAY_TCP_PROXY_DOMAIN` and set `PG_SSLMODE=require`.
+- `DATABASE_URL` is the metadata database for OpenMemory itself. The pgvector settings (`PG_HOST`, `PG_PORT`, `PG_DB`, `PG_USER`, `PG_PASSWORD`, `PG_SSLMODE`) are used separately by Mem0 for vector storage.

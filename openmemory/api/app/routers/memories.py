@@ -22,7 +22,7 @@ from fastapi_pagination import Page, Params
 from fastapi_pagination.ext.sqlalchemy import paginate as sqlalchemy_paginate
 from pydantic import BaseModel
 from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 router = APIRouter(prefix="/api/v1/memories", tags=["memories"])
 
@@ -271,25 +271,24 @@ async def create_memory(
         
         # Process Qdrant response
         if isinstance(qdrant_response, dict) and 'results' in qdrant_response:
-            created_memories = []
+            affected_memories = []
             
             for result in qdrant_response['results']:
-                if result['event'] == 'ADD':
-                    # Get the Qdrant-generated ID
-                    memory_id = UUID(result['id'])
-                    
-                    # Check if memory already exists
-                    existing_memory = db.query(Memory).filter(Memory.id == memory_id).first()
-                    
+                event = result.get('event')
+                if event not in ('ADD', 'UPDATE'):
+                    continue
+
+                memory_id = UUID(result['id'])
+                existing_memory = db.query(Memory).filter(Memory.id == memory_id).first()
+
+                if event == 'ADD':
                     if existing_memory:
-                        # Update existing memory
                         existing_memory.state = MemoryState.active
                         existing_memory.content = result['memory']
                         memory = existing_memory
                     else:
-                        # Create memory with the EXACT SAME ID from Qdrant
                         memory = Memory(
-                            id=memory_id,  # Use the same ID that Qdrant generated
+                            id=memory_id,
                             user_id=user.id,
                             app_id=app_obj.id,
                             content=result['memory'],
@@ -297,27 +296,36 @@ async def create_memory(
                             state=MemoryState.active
                         )
                         db.add(memory)
-                    
-                    # Create history entry
                     history = MemoryStatusHistory(
                         memory_id=memory_id,
                         changed_by=user.id,
-                        old_state=MemoryState.deleted if existing_memory else MemoryState.deleted,
+                        old_state=MemoryState.deleted,
                         new_state=MemoryState.active
                     )
                     db.add(history)
-                    
-                    created_memories.append(memory)
-            
+                    affected_memories.append(memory)
+
+                elif event == 'UPDATE' and existing_memory:
+                    existing_memory.content = result['memory']
+                    affected_memories.append(existing_memory)
+
             # Commit all changes at once
-            if created_memories:
+            if affected_memories:
                 db.commit()
-                for memory in created_memories:
+                for memory in affected_memories:
                     db.refresh(memory)
-                
-                # Return the first memory (for API compatibility)
-                # but all memories are now saved to the database
-                return created_memories[0]
+                return affected_memories[0]
+
+            # NOOP / all events skipped — return the most recent memory for this user/app
+            fallback = (
+                db.query(Memory)
+                .filter(Memory.user_id == user.id, Memory.app_id == app_obj.id,
+                        Memory.state == MemoryState.active)
+                .order_by(Memory.created_at.desc())
+                .first()
+            )
+            if fallback:
+                return fallback
     except Exception as qdrant_error:
         logging.warning(f"Qdrant operation failed: {qdrant_error}.")
         # Return a json response with the error
@@ -569,14 +577,12 @@ async def filter_memories(
     if request.app_ids:
         query = query.filter(Memory.app_id.in_(request.app_ids))
 
-    # Add joins for app and categories
+    # Add join for app (needed for sort by app_name)
     query = query.outerjoin(App, Memory.app_id == App.id)
 
-    # Apply category filter
+    # Apply category filter using exists subquery to avoid duplicate rows
     if request.category_ids:
-        query = query.join(Memory.categories).filter(Category.id.in_(request.category_ids))
-    else:
-        query = query.outerjoin(Memory.categories)
+        query = query.filter(Memory.categories.any(Category.id.in_(request.category_ids)))
 
     # Apply date filters
     if request.from_date:
@@ -611,10 +617,10 @@ async def filter_memories(
         # Default sorting
         query = query.order_by(Memory.created_at.desc())
 
-    # Add eager loading for categories and make the query distinct
+    # Use selectinload for categories — runs a separate SELECT, no duplicate rows
     query = query.options(
-        joinedload(Memory.categories)
-    ).distinct(Memory.id)
+        selectinload(Memory.categories)
+    )
 
     # Use fastapi-pagination's paginate function
     return sqlalchemy_paginate(
@@ -658,19 +664,20 @@ async def get_related_memories(
         return Page.create([], total=0, params=params)
     
     # Build query for related memories
-    query = db.query(Memory).distinct(Memory.id).filter(
-        Memory.user_id == user.id,
-        Memory.id != memory_id,
-        Memory.state != MemoryState.deleted
-    ).join(Memory.categories).filter(
-        Category.id.in_(category_ids)
-    ).options(
-        joinedload(Memory.categories),
-        joinedload(Memory.app)
-    ).order_by(
-        func.count(Category.id).desc(),
-        Memory.created_at.desc()
-    ).group_by(Memory.id)
+    query = (
+        db.query(Memory)
+        .filter(
+            Memory.user_id == user.id,
+            Memory.id != memory_id,
+            Memory.state != MemoryState.deleted,
+            Memory.categories.any(Category.id.in_(category_ids))
+        )
+        .options(
+            selectinload(Memory.categories),
+            selectinload(Memory.app)
+        )
+        .order_by(Memory.created_at.desc())
+    )
     
     # ⚡ Force page size to be 5
     params = Params(page=params.page, size=5)
