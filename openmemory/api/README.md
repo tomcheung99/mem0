@@ -76,4 +76,4 @@ Once the server is running, you can access the API documentation at:
 - `MCP_API_KEY` enables authentication for MCP SSE and message endpoints.
 - `ALLOWED_ORIGINS` should be restricted to trusted domains in production.
 - `MCP_RATE_LIMIT` applies per user ID on the SSE connection endpoint.
-- For Railway deployments using pgvector, use the environment variable names from [../railway.yaml](../railway.yaml).
+- For Railway deployments using pgvector, use the environment variable names from [.env.example](.env.example) or Railway-native PostgreSQL variables such as `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, and `PGPASSWORD`.

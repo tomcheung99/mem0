@@ -136,6 +136,13 @@ def reset_memory_client():
 
 def get_default_memory_config():
     """Get default memory client configuration with sensible defaults."""
+    pg_host = os.environ.get('PG_HOST') or os.environ.get('PGHOST')
+    pg_port = os.environ.get('PG_PORT') or os.environ.get('PGPORT')
+    pg_db = os.environ.get('PG_DB') or os.environ.get('PGDATABASE') or 'mem0'
+    pg_user = os.environ.get('PG_USER') or os.environ.get('PGUSER') or 'mem0'
+    pg_password = os.environ.get('PG_PASSWORD') or os.environ.get('PGPASSWORD') or 'mem0'
+    pg_sslmode = os.environ.get('PG_SSLMODE') or os.environ.get('PGSSLMODE')
+
     # Detect vector store based on environment variables
     vector_store_config = {
         "collection_name": "openmemory",
@@ -173,15 +180,17 @@ def get_default_memory_config():
             "collection_name": "openmemory",
             "redis_url": os.environ.get('REDIS_URL')
         }
-    elif os.environ.get('PG_HOST') and os.environ.get('PG_PORT'):
+    elif pg_host and pg_port:
         vector_store_provider = "pgvector"
         vector_store_config.update({
-            "host": os.environ.get('PG_HOST'),
-            "port": int(os.environ.get('PG_PORT')),
-            "dbname": os.environ.get('PG_DB', 'mem0'),
-            "user": os.environ.get('PG_USER', 'mem0'),
-            "password": os.environ.get('PG_PASSWORD', 'mem0')
+            "host": pg_host,
+            "port": int(pg_port),
+            "dbname": pg_db,
+            "user": pg_user,
+            "password": pg_password,
         })
+        if pg_sslmode:
+            vector_store_config["sslmode"] = pg_sslmode
     elif os.environ.get('MILVUS_HOST') and os.environ.get('MILVUS_PORT'):
         vector_store_provider = "milvus"
         # Construct the full URL as expected by MilvusDBConfig
@@ -235,7 +244,12 @@ def get_default_memory_config():
             "port": 6333,
         })
     
-    print(f"Auto-detected vector store: {vector_store_provider} with config: {vector_store_config}")
+    logging.info(
+        "Auto-detected vector store provider=%s host=%s db=%s",
+        vector_store_provider,
+        vector_store_config.get("host"),
+        vector_store_config.get("dbname"),
+    )
     
     return {
         "vector_store": {
