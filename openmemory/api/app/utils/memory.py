@@ -369,8 +369,14 @@ def get_memory_client(custom_instructions: str = None):
                             if config["embedder"].get("provider") == "ollama":
                                 config["embedder"] = _fix_ollama_urls(config["embedder"])
 
+                        # Note: We don't allow database to override vector_store configuration
+                        # because connection details should always come from environment variables.
+                        # This prevents stale database config from breaking the connection.
                         if "vector_store" in mem0_config and mem0_config["vector_store"] is not None:
-                            config["vector_store"] = mem0_config["vector_store"]
+                            logging.warning(
+                                "Ignoring vector_store config from database. "
+                                "Using environment-based configuration instead."
+                            )
                 else:
                     print("No configuration found in database, using defaults")
                         
