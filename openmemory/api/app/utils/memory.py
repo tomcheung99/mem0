@@ -188,20 +188,25 @@ def get_default_memory_config():
             pg_host, pg_port, pg_db, pg_user, bool(pg_password)
         )
         # Build connection string directly for better control
-        from urllib.parse import quote_plus
-        safe_password = quote_plus(pg_password) if pg_password else ""
-        safe_user = quote_plus(pg_user) if pg_user else ""
+        # Use quote() (RFC 3986) instead of quote_plus() so spaces become %20, not +
+        from urllib.parse import quote
+        safe_password = quote(pg_password, safe="") if pg_password else ""
+        safe_user = quote(pg_user, safe="") if pg_user else ""
         connection_string = f"postgresql://{safe_user}:{safe_password}@{pg_host}:{pg_port}/{pg_db}"
         if pg_sslmode:
             connection_string += f"?sslmode={pg_sslmode}"
         logging.info("PGVector connection_string (without password): postgresql://%s:***@%s:%s/%s",
                      pg_user, pg_host, pg_port, pg_db)
-        vector_store_config.update({
+        # Replace the entire config to avoid the stale host="mem0_store" default
+        vector_store_config = {
+            "collection_name": "openmemory",
+            "host": pg_host,
+            "port": int(pg_port),
             "connection_string": connection_string,
             "embedding_model_dims": 1536,
             "minconn": 1,
             "maxconn": 2,  # Reduced for Railway compatibility
-        })
+        }
     elif os.environ.get('MILVUS_HOST') and os.environ.get('MILVUS_PORT'):
         vector_store_provider = "milvus"
         # Construct the full URL as expected by MilvusDBConfig
