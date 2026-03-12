@@ -1,4 +1,6 @@
+import asyncio
 import datetime
+import logging
 from uuid import uuid4
 
 from app.config import ALLOWED_ORIGINS, ALLOW_CREDENTIALS, DEFAULT_APP_ID, USER_ID
@@ -20,8 +22,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Create all tables
-Base.metadata.create_all(bind=engine)
+app.state.db_initialized = False
+app.state.db_init_error = None
 
 # Check for USER_ID and create default user if needed
 def create_default_user():
@@ -71,14 +73,42 @@ def create_default_app():
     finally:
         db.close()
 
-# Create default user on startup
-create_default_user()
-create_default_app()
+
+def initialize_database_state():
+    logging.info("Initializing database state")
+    Base.metadata.create_all(bind=engine)
+    create_default_user()
+    create_default_app()
+    logging.info("Database state initialized")
+
+
+async def initialize_database_with_retry(max_attempts: int = 10, delay_seconds: int = 5):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await asyncio.to_thread(initialize_database_state)
+            app.state.db_initialized = True
+            app.state.db_init_error = None
+            return
+        except Exception as exc:
+            app.state.db_init_error = str(exc)
+            logging.exception("Database initialization attempt %s/%s failed", attempt, max_attempts)
+            if attempt == max_attempts:
+                return
+            await asyncio.sleep(delay_seconds)
+
+
+@app.on_event("startup")
+async def schedule_database_initialization():
+    asyncio.create_task(initialize_database_with_retry())
 
 
 @app.get("/health")
 async def healthcheck():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "database_initialized": app.state.db_initialized,
+        "database_init_error": app.state.db_init_error,
+    }
 
 # Setup MCP server
 setup_mcp_server(app)
