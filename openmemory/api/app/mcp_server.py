@@ -102,6 +102,7 @@ sse = SseServerTransport("/mcp/messages/")
 async def add_memories(text: str) -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
+    logging.info("MCP add_memories called user_id=%s client_name=%s", uid, client_name)
 
     if not uid:
         return "Error: user_id not provided"
@@ -111,6 +112,7 @@ async def add_memories(text: str) -> str:
     # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
+        logging.warning("add_memories unavailable because memory client is not initialized")
         return "Error: Memory system is currently unavailable. Please try again later."
 
     try:
@@ -186,6 +188,7 @@ async def add_memories(text: str) -> str:
 async def search_memory(query: str) -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
+    logging.info("MCP search_memory called user_id=%s client_name=%s", uid, client_name)
     if not uid:
         return "Error: user_id not provided"
     if not client_name:
@@ -194,6 +197,7 @@ async def search_memory(query: str) -> str:
     # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
+        logging.warning("search_memory unavailable because memory client is not initialized")
         return "Error: Memory system is currently unavailable. Please try again later."
 
     try:
@@ -264,6 +268,7 @@ async def search_memory(query: str) -> str:
 async def list_memories() -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
+    logging.info("MCP list_memories called user_id=%s client_name=%s", uid, client_name)
     if not uid:
         return "Error: user_id not provided"
     if not client_name:
@@ -272,6 +277,7 @@ async def list_memories() -> str:
     # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
+        logging.warning("list_memories unavailable because memory client is not initialized")
         return "Error: Memory system is currently unavailable. Please try again later."
 
     try:
@@ -333,6 +339,7 @@ async def list_memories() -> str:
 async def delete_memories(memory_ids: list[str]) -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
+    logging.info("MCP delete_memories called user_id=%s client_name=%s count=%s", uid, client_name, len(memory_ids))
     if not uid:
         return "Error: user_id not provided"
     if not client_name:
@@ -341,6 +348,7 @@ async def delete_memories(memory_ids: list[str]) -> str:
     # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
+        logging.warning("delete_memories unavailable because memory client is not initialized")
         return "Error: Memory system is currently unavailable. Please try again later."
 
     try:
@@ -407,6 +415,7 @@ async def delete_memories(memory_ids: list[str]) -> str:
 async def delete_all_memories() -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
+    logging.info("MCP delete_all_memories called user_id=%s client_name=%s", uid, client_name)
     if not uid:
         return "Error: user_id not provided"
     if not client_name:
@@ -415,6 +424,7 @@ async def delete_all_memories() -> str:
     # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
+        logging.warning("delete_all_memories unavailable because memory client is not initialized")
         return "Error: Memory system is currently unavailable. Please try again later."
 
     try:

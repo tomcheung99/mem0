@@ -29,6 +29,7 @@ Example configuration that will be automatically adjusted:
 
 import hashlib
 import json
+import logging
 import os
 import socket
 
@@ -302,6 +303,7 @@ def get_memory_client(custom_instructions: str = None):
     global _memory_client, _config_hash
 
     try:
+        logging.info("Initializing memory client configuration")
         # Start with default configuration
         config = get_default_memory_config()
         
@@ -362,6 +364,13 @@ def get_memory_client(custom_instructions: str = None):
         print("Parsing environment variables in final config...")
         config = _parse_environment_variables(config)
 
+        logging.info(
+            "Memory config resolved with provider=%s embedder=%s vector_store=%s",
+            config.get("llm", {}).get("provider"),
+            config.get("embedder", {}).get("provider"),
+            config.get("vector_store", {}).get("provider"),
+        )
+
         # Check if config has changed by comparing hashes
         current_config_hash = _get_config_hash(config)
         
@@ -369,21 +378,26 @@ def get_memory_client(custom_instructions: str = None):
         if _memory_client is None or _config_hash != current_config_hash:
             print(f"Initializing memory client with config hash: {current_config_hash}")
             try:
+                logging.info("Creating new memory client instance")
                 _memory_client = Memory.from_config(config_dict=config)
                 _config_hash = current_config_hash
                 print("Memory client initialized successfully")
+                logging.info("Memory client initialized successfully")
             except Exception as init_error:
                 print(f"Warning: Failed to initialize memory client: {init_error}")
                 print("Server will continue running with limited memory functionality")
+                logging.exception("Failed to initialize memory client")
                 _memory_client = None
                 _config_hash = None
                 return None
-        
+
+        logging.info("Reusing initialized memory client")
         return _memory_client
         
     except Exception as e:
         print(f"Warning: Exception occurred while initializing memory client: {e}")
         print("Server will continue running with limited memory functionality")
+        logging.exception("Unhandled exception while initializing memory client")
         return None
 
 
