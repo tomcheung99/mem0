@@ -31,6 +31,8 @@ app.add_middleware(
 
 app.state.db_initialized = False
 app.state.db_init_error = None
+app.state.db_init_status = "pending"
+app.state.db_init_stage = "not-started"
 
 # Check for USER_ID and create default user if needed
 def create_default_user():
@@ -83,23 +85,42 @@ def create_default_app():
 
 def initialize_database_state():
     logging.info("Initializing database state")
+    set_database_state(False, None, status="initializing", stage="create-tables")
     Base.metadata.create_all(bind=engine)
+
+    logging.info("Database tables verified")
+    set_database_state(False, None, status="initializing", stage="create-default-user")
     create_default_user()
+
+    logging.info("Default user verified")
+    set_database_state(False, None, status="initializing", stage="create-default-app")
     create_default_app()
-    set_database_state(True, None)
+
+    set_database_state(True, None, status="ready", stage="complete")
     logging.info("Database state initialized")
 
 
 async def initialize_database_with_retry(app: FastAPI, max_attempts: int = 10, delay_seconds: int = 5):
     for attempt in range(1, max_attempts + 1):
         try:
+            app.state.db_init_status = "initializing"
+            app.state.db_init_stage = f"attempt-{attempt}"
             await asyncio.to_thread(initialize_database_state)
             app.state.db_initialized = True
             app.state.db_init_error = None
+            app.state.db_init_status = "ready"
+            app.state.db_init_stage = "complete"
             return
         except Exception as exc:
             app.state.db_init_error = str(exc)
-            set_database_state(False, str(exc))
+            app.state.db_init_status = "retrying" if attempt < max_attempts else "failed"
+            app.state.db_init_stage = f"attempt-{attempt}"
+            set_database_state(
+                False,
+                str(exc),
+                status="retrying" if attempt < max_attempts else "failed",
+                stage=f"attempt-{attempt}",
+            )
             logging.exception("Database initialization attempt %s/%s failed", attempt, max_attempts)
             if attempt == max_attempts:
                 return
@@ -108,11 +129,13 @@ async def initialize_database_with_retry(app: FastAPI, max_attempts: int = 10, d
 
 @app.get("/health")
 async def healthcheck():
-    database_initialized, database_init_error = get_database_state()
+    database_initialized, database_init_error, database_status, database_stage = get_database_state()
     return {
         "status": "ok",
         "database_initialized": database_initialized,
         "database_init_error": database_init_error,
+        "database_status": database_status,
+        "database_stage": database_stage,
     }
 
 # Setup MCP server
