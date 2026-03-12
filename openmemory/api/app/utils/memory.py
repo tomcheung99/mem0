@@ -188,6 +188,8 @@ def get_default_memory_config():
             "dbname": pg_db,
             "user": pg_user,
             "password": pg_password,
+            "embedding_model_dims": 1536,
+            "diskann": False,
         })
         if pg_sslmode:
             vector_store_config["sslmode"] = pg_sslmode
