@@ -38,7 +38,7 @@ def get_categories_for_memory(memory: str) -> List[str]:
             {"role": "user", "content": memory}
         ]
 
-        # Let OpenAI handle the pydantic parsing directly
+        # Let OpenAI handle the pydantic parsing directlys
         completion = openai_client.beta.chat.completions.parse(
             model="gpt-4o-mini",
             messages=messages,
