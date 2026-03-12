@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class MemoryBase(BaseModel):
@@ -51,11 +51,12 @@ class MemoryResponse(BaseModel):
     categories: List[str]
     metadata_: Optional[dict] = None
 
-    @validator('created_at', pre=True)
-    def convert_to_epoch(cls, v):
-        if isinstance(v, datetime):
-            return int(v.timestamp())
-        return v
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def convert_to_epoch(cls, value):
+        if isinstance(value, datetime):
+            return int(value.timestamp())
+        return value
 
 class PaginatedMemoryResponse(BaseModel):
     items: List[MemoryResponse]
