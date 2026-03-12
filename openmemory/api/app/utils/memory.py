@@ -320,7 +320,7 @@ def get_memory_client(custom_instructions: str = None):
         logging.info("Initializing memory client configuration")
         # Start with default configuration
         config = get_default_memory_config()
-        database_initialized, database_init_error = get_database_state()
+        database_initialized, database_init_error, _, _ = get_database_state()
         
         # Variable to track custom instructions
         db_custom_instructions = None
