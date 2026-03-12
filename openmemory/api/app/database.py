@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+DATABASE_READY = False
+DATABASE_INIT_ERROR = None
+
 # load .env file (make sure you have DATABASE_URL set)
 load_dotenv()
 
@@ -21,6 +24,16 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # Base class for models
 Base = declarative_base()
+
+
+def set_database_state(is_ready: bool, error: str | None = None):
+    global DATABASE_READY, DATABASE_INIT_ERROR
+    DATABASE_READY = is_ready
+    DATABASE_INIT_ERROR = error
+
+
+def get_database_state() -> tuple[bool, str | None]:
+    return DATABASE_READY, DATABASE_INIT_ERROR
 
 # Dependency for FastAPI
 def get_db():

@@ -33,7 +33,7 @@ import logging
 import os
 import socket
 
-from app.database import SessionLocal
+from app.database import SessionLocal, get_database_state
 from app.models import Config as ConfigModel
 
 from mem0 import Memory
@@ -306,53 +306,60 @@ def get_memory_client(custom_instructions: str = None):
         logging.info("Initializing memory client configuration")
         # Start with default configuration
         config = get_default_memory_config()
+        database_initialized, database_init_error = get_database_state()
         
         # Variable to track custom instructions
         db_custom_instructions = None
         
         # Load configuration from database
-        try:
-            db = SessionLocal()
-            db_config = db.query(ConfigModel).filter(ConfigModel.key == "main").first()
-            
-            if db_config:
-                json_config = db_config.value
+        if database_initialized:
+            try:
+                db = SessionLocal()
+                db_config = db.query(ConfigModel).filter(ConfigModel.key == "main").first()
                 
-                # Extract custom instructions from openmemory settings
-                if "openmemory" in json_config and "custom_instructions" in json_config["openmemory"]:
-                    db_custom_instructions = json_config["openmemory"]["custom_instructions"]
-                
-                # Override defaults with configurations from the database
-                if "mem0" in json_config:
-                    mem0_config = json_config["mem0"]
+                if db_config:
+                    json_config = db_config.value
                     
-                    # Update LLM configuration if available
-                    if "llm" in mem0_config and mem0_config["llm"] is not None:
-                        config["llm"] = mem0_config["llm"]
+                    # Extract custom instructions from openmemory settings
+                    if "openmemory" in json_config and "custom_instructions" in json_config["openmemory"]:
+                        db_custom_instructions = json_config["openmemory"]["custom_instructions"]
+                    
+                    # Override defaults with configurations from the database
+                    if "mem0" in json_config:
+                        mem0_config = json_config["mem0"]
                         
-                        # Fix Ollama URLs for Docker if needed
-                        if config["llm"].get("provider") == "ollama":
-                            config["llm"] = _fix_ollama_urls(config["llm"])
-                    
-                    # Update Embedder configuration if available
-                    if "embedder" in mem0_config and mem0_config["embedder"] is not None:
-                        config["embedder"] = mem0_config["embedder"]
-                        
-                        # Fix Ollama URLs for Docker if needed
-                        if config["embedder"].get("provider") == "ollama":
-                            config["embedder"] = _fix_ollama_urls(config["embedder"])
-
-                    if "vector_store" in mem0_config and mem0_config["vector_store"] is not None:
-                        config["vector_store"] = mem0_config["vector_store"]
-            else:
-                print("No configuration found in database, using defaults")
-                    
-            db.close()
+                        # Update LLM configuration if available
+                        if "llm" in mem0_config and mem0_config["llm"] is not None:
+                            config["llm"] = mem0_config["llm"]
                             
-        except Exception as e:
-            print(f"Warning: Error loading configuration from database: {e}")
-            print("Using default configuration")
-            # Continue with default configuration if database config can't be loaded
+                            # Fix Ollama URLs for Docker if needed
+                            if config["llm"].get("provider") == "ollama":
+                                config["llm"] = _fix_ollama_urls(config["llm"])
+                        
+                        # Update Embedder configuration if available
+                        if "embedder" in mem0_config and mem0_config["embedder"] is not None:
+                            config["embedder"] = mem0_config["embedder"]
+                            
+                            # Fix Ollama URLs for Docker if needed
+                            if config["embedder"].get("provider") == "ollama":
+                                config["embedder"] = _fix_ollama_urls(config["embedder"])
+
+                        if "vector_store" in mem0_config and mem0_config["vector_store"] is not None:
+                            config["vector_store"] = mem0_config["vector_store"]
+                else:
+                    print("No configuration found in database, using defaults")
+                        
+                db.close()
+                                
+            except Exception as e:
+                print(f"Warning: Error loading configuration from database: {e}")
+                print("Using default configuration")
+                # Continue with default configuration if database config can't be loaded
+        else:
+            logging.warning(
+                "Database state not ready yet, skipping DB-backed memory config load: %s",
+                database_init_error,
+            )
 
         # Use custom_instructions parameter first, then fall back to database value
         instructions_to_use = custom_instructions or db_custom_instructions

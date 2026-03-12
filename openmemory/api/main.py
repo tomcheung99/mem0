@@ -1,10 +1,11 @@
 import asyncio
 import datetime
 import logging
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 from app.config import ALLOWED_ORIGINS, ALLOW_CREDENTIALS, DEFAULT_APP_ID, USER_ID
-from app.database import Base, SessionLocal, engine
+from app.database import Base, SessionLocal, engine, get_database_state, set_database_state
 from app.mcp_server import setup_mcp_server
 from app.models import App, User
 from app.routers import apps_router, backup_router, config_router, memories_router, stats_router
@@ -12,7 +13,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi_pagination import add_pagination
 
-app = FastAPI(title="OpenMemory API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(initialize_database_with_retry(app))
+    yield
+
+
+app = FastAPI(title="OpenMemory API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -79,10 +86,11 @@ def initialize_database_state():
     Base.metadata.create_all(bind=engine)
     create_default_user()
     create_default_app()
+    set_database_state(True, None)
     logging.info("Database state initialized")
 
 
-async def initialize_database_with_retry(max_attempts: int = 10, delay_seconds: int = 5):
+async def initialize_database_with_retry(app: FastAPI, max_attempts: int = 10, delay_seconds: int = 5):
     for attempt in range(1, max_attempts + 1):
         try:
             await asyncio.to_thread(initialize_database_state)
@@ -91,23 +99,20 @@ async def initialize_database_with_retry(max_attempts: int = 10, delay_seconds: 
             return
         except Exception as exc:
             app.state.db_init_error = str(exc)
+            set_database_state(False, str(exc))
             logging.exception("Database initialization attempt %s/%s failed", attempt, max_attempts)
             if attempt == max_attempts:
                 return
             await asyncio.sleep(delay_seconds)
 
 
-@app.on_event("startup")
-async def schedule_database_initialization():
-    asyncio.create_task(initialize_database_with_retry())
-
-
 @app.get("/health")
 async def healthcheck():
+    database_initialized, database_init_error = get_database_state()
     return {
         "status": "ok",
-        "database_initialized": app.state.db_initialized,
-        "database_init_error": app.state.db_init_error,
+        "database_initialized": database_initialized,
+        "database_init_error": database_init_error,
     }
 
 # Setup MCP server
