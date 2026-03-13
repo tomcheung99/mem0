@@ -28,7 +28,7 @@ from app.utils.db import get_user_and_app
 from app.utils.memory import get_memory_client
 from app.utils.permissions import check_memory_access_permissions
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, status
 from fastapi.routing import APIRouter
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from mcp.server.fastmcp import FastMCP
@@ -489,18 +489,14 @@ def update_memory(memory_id: str, new_content: str) -> str:
         return f"Error updating memory: {e}"
 
 
-@mcp_router.get("/{client_name}/sse/{user_id}")
-@limiter.limit(MCP_RATE_LIMIT)
-async def handle_sse(request: Request, _: None = Depends(verify_api_key)):
-    """Handle SSE connections for a specific user and client"""
-    # Extract user_id and client_name from path parameters
+async def _handle_sse_impl(request: Request):
+    """Core SSE connection handler shared across route variants."""
     uid = request.path_params.get("user_id")
     user_token = user_id_var.set(uid or "")
     client_name = request.path_params.get("client_name")
     client_token = client_name_var.set(client_name or "")
 
     try:
-        # Handle SSE connection
         async with sse.connect_sse(
             request.scope,
             request.receive,
@@ -512,9 +508,34 @@ async def handle_sse(request: Request, _: None = Depends(verify_api_key)):
                 mcp._mcp_server.create_initialization_options(),
             )
     finally:
-        # Clean up context variables
         user_id_var.reset(user_token)
         client_name_var.reset(client_token)
+
+
+@mcp_router.get("/{client_name}/sse/{user_id}")
+@limiter.limit(MCP_RATE_LIMIT)
+async def handle_sse(request: Request, _: None = Depends(verify_api_key)):
+    """Handle SSE connections for a specific user and client"""
+    await _handle_sse_impl(request)
+
+
+@mcp_router.get("/{client_name}/sse/{user_id}/")
+@limiter.limit(MCP_RATE_LIMIT)
+async def handle_sse_trailing(request: Request, _: None = Depends(verify_api_key)):
+    """Handle SSE connections (trailing slash variant)"""
+    await _handle_sse_impl(request)
+
+
+@mcp_router.head("/{client_name}/sse/{user_id}")
+async def handle_sse_head(request: Request, _: None = Depends(verify_api_key)):
+    """HEAD probe for SSE endpoint"""
+    return Response(status_code=200)
+
+
+@mcp_router.head("/{client_name}/sse/{user_id}/")
+async def handle_sse_head_trailing(request: Request, _: None = Depends(verify_api_key)):
+    """HEAD probe for SSE endpoint (trailing slash variant)"""
+    return Response(status_code=200)
 
 
 @mcp_router.post("/messages/")
