@@ -230,7 +230,7 @@ async def search_memory(query: str) -> str:
             hits = memory_client.vector_store.search(
                 query=query, 
                 vectors=embeddings, 
-                limit=10, 
+                limit=100, 
                 filters=filters,
             )
 
@@ -251,6 +251,9 @@ async def search_memory(query: str) -> str:
                     "updated_at": payload.get("updated_at"), 
                     "score": score,
                 })
+
+            # Keep top 10 after ACL filtering
+            results = results[:10]
 
             for r in results: 
                 if r.get("id"): 
