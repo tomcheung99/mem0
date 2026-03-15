@@ -118,7 +118,7 @@ def get_streamable_manager() -> StreamableHTTPSessionManager:
         _streamable_manager = StreamableHTTPSessionManager(
             app=mcp._mcp_server,
             json_response=False,
-            stateless=False,
+            stateless=True,
         )
     return _streamable_manager
 
