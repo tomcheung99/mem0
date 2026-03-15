@@ -33,6 +33,9 @@ from fastapi.routing import APIRouter
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from starlette.responses import JSONResponse as _StarletteJSONResponse
+from starlette.routing import Route as _StarletteRoute
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -98,6 +101,54 @@ mcp_router = APIRouter(prefix="/mcp")
 
 # Initialize SSE transport
 sse = SseServerTransport("/mcp/messages/")
+
+# Streamable HTTP session manager (proxy-friendly alternative to SSE)
+_streamable_manager: StreamableHTTPSessionManager | None = None
+
+
+def get_streamable_manager() -> StreamableHTTPSessionManager:
+    """Get or lazily create the StreamableHTTP session manager."""
+    global _streamable_manager
+    if _streamable_manager is None:
+        _streamable_manager = StreamableHTTPSessionManager(
+            app=mcp._mcp_server,
+            json_response=False,
+            stateless=False,
+        )
+    return _streamable_manager
+
+
+async def _streamable_http_handler(scope, receive, send):
+    """Raw ASGI handler for the Streamable HTTP transport endpoint."""
+    request = Request(scope, receive, send)
+
+    # API key check (mirrors verify_api_key logic)
+    if MCP_API_KEY:
+        provided_key = None
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            provided_key = auth_header[7:]
+        if not provided_key:
+            provided_key = (
+                request.headers.get("x-api-key")
+                or request.query_params.get("api_key")
+            )
+        if provided_key != MCP_API_KEY:
+            resp = _StarletteJSONResponse(
+                {"detail": "Invalid API Key"}, status_code=401
+            )
+            await resp(scope, receive, send)
+            return
+
+    # Extract path params and set context variables
+    path_params = scope.get("path_params", {})
+    uid = path_params.get("user_id", "")
+    cname = path_params.get("client_name", "")
+    user_id_var.set(uid)
+    client_name_var.set(cname)
+
+    manager = get_streamable_manager()
+    await manager.handle_request(scope, receive, send)
 
 @mcp.tool(description="Add a new memory. This method is called everytime the user informs anything about themselves, their preferences, or anything that has any relevant information which can be useful in the future conversation. This can also be called when the user asks you to remember something.")
 async def add_memories(text: str, metadata: dict | None = None) -> str:
@@ -651,5 +702,19 @@ def setup_mcp_server(app: FastAPI):
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-    # Include MCP router in the FastAPI app
+    # Include MCP router in the FastAPI app (SSE endpoints)
     app.include_router(mcp_router)
+
+    # Mount Streamable HTTP transport (proxy-friendly, no persistent connection)
+    for _path in (
+        "/mcp/{client_name}/http/{user_id}",
+        "/mcp/{client_name}/http/{user_id}/",
+    ):
+        app.routes.insert(
+            0,
+            _StarletteRoute(
+                _path,
+                _streamable_http_handler,
+                methods=["GET", "POST", "DELETE"],
+            ),
+        )

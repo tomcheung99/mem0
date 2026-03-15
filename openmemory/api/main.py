@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from app.config import ALLOWED_ORIGINS, ALLOW_CREDENTIALS, DEFAULT_APP_ID, USER_ID
 from app.database import Base, SessionLocal, engine, get_database_state, set_database_state
-from app.mcp_server import setup_mcp_server
+from app.mcp_server import get_streamable_manager, setup_mcp_server
 from app.models import App, User
 from app.routers import apps_router, backup_router, config_router, memories_router, stats_router
 from fastapi import FastAPI
@@ -17,8 +17,9 @@ from sqlalchemy import text
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    asyncio.create_task(initialize_database_with_retry(app))
-    yield
+    async with get_streamable_manager().run():
+        asyncio.create_task(initialize_database_with_retry(app))
+        yield
 
 
 app = FastAPI(title="OpenMemory API", lifespan=lifespan)
