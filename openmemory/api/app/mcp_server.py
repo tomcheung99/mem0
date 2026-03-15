@@ -54,6 +54,7 @@ def get_memory_client_safe():
 # Context variables for user_id and client_name
 user_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("user_id")
 client_name_var: contextvars.ContextVar[str] = contextvars.ContextVar("client_name")
+session_contexts: dict[uuid.UUID, tuple[str, str]] = {}
 
 security = HTTPBearer(auto_error=False)
 
@@ -498,19 +499,41 @@ async def _handle_sse_impl(request: Request):
     user_token = user_id_var.set(uid or "")
     client_name = request.path_params.get("client_name")
     client_token = client_name_var.set(client_name or "")
+    session_id: uuid.UUID | None = None
 
     try:
+        existing_session_ids = set(sse._read_stream_writers.keys())
         async with sse.connect_sse(
             request.scope,
             request.receive,
             request._send,
         ) as (read_stream, write_stream):
+            created_session_ids = set(sse._read_stream_writers.keys()) - existing_session_ids
+            if len(created_session_ids) == 1:
+                session_id = created_session_ids.pop()
+                session_contexts[session_id] = (uid or "", client_name or "")
+                logging.info(
+                    "Registered MCP session context session_id=%s user_id=%s client_name=%s",
+                    session_id.hex,
+                    uid,
+                    client_name,
+                )
+            elif created_session_ids:
+                logging.warning(
+                    "Unexpected multiple MCP sessions created for user_id=%s client_name=%s count=%s",
+                    uid,
+                    client_name,
+                    len(created_session_ids),
+                )
+
             await mcp._mcp_server.run(
                 read_stream,
                 write_stream,
                 mcp._mcp_server.create_initialization_options(),
             )
     finally:
+        if session_id is not None:
+            session_contexts.pop(session_id, None)
         user_id_var.reset(user_token)
         client_name_var.reset(client_token)
 
@@ -553,7 +576,35 @@ async def handle_client_message(request: Request, _: None = Depends(verify_api_k
 
 async def process_post_message(request: Request):
     """Handle POST messages for SSE"""
+    user_token = None
+    client_token = None
     try:
+        uid = request.path_params.get("user_id")
+        client_name = request.path_params.get("client_name")
+
+        if not uid or not client_name:
+            session_id_param = request.query_params.get("session_id")
+            if session_id_param:
+                try:
+                    session_id = uuid.UUID(hex=session_id_param)
+                except ValueError:
+                    session_id = None
+                if session_id is not None:
+                    session_context = session_contexts.get(session_id)
+                    if session_context:
+                        uid, client_name = session_context
+                        logging.info(
+                            "Resolved MCP session context from session_id=%s user_id=%s client_name=%s",
+                            session_id.hex,
+                            uid,
+                            client_name,
+                        )
+
+        if uid is not None:
+            user_token = user_id_var.set(uid)
+        if client_name is not None:
+            client_token = client_name_var.set(client_name)
+
         body = await request.body()
 
         # Create a simple receive function that returns the body
@@ -570,7 +621,10 @@ async def process_post_message(request: Request):
         # Return a success response
         return {"status": "ok"}
     finally:
-        pass
+        if user_token is not None:
+            user_id_var.reset(user_token)
+        if client_token is not None:
+            client_name_var.reset(client_token)
 
 def setup_mcp_server(app: FastAPI):
     """Setup MCP server with the FastAPI application"""
