@@ -501,12 +501,31 @@ async def _handle_sse_impl(request: Request):
     client_token = client_name_var.set(client_name or "")
     session_id: uuid.UUID | None = None
 
+    # Wrap the ASGI send to inject anti-buffering headers into the SSE response.
+    # Reverse proxies (Traefik, nginx, Cloudflare) buffer SSE by default which
+    # prevents the MCP initialization handshake from completing in time.
+    original_send = request._send
+
+    async def unbuffered_send(message):
+        if message.get("type") == "http.response.start":
+            headers = dict(message.get("headers", []))
+            extra_headers = [
+                (b"x-accel-buffering", b"no"),       # nginx
+                (b"cache-control", b"no-cache, no-transform"),  # general / CDN
+                (b"x-content-type-options", b"nosniff"),
+            ]
+            message = {
+                **message,
+                "headers": list(message.get("headers", [])) + extra_headers,
+            }
+        await original_send(message)
+
     try:
         existing_session_ids = set(sse._read_stream_writers.keys())
         async with sse.connect_sse(
             request.scope,
             request.receive,
-            request._send,
+            unbuffered_send,
         ) as (read_stream, write_stream):
             created_session_ids = set(sse._read_stream_writers.keys()) - existing_session_ids
             if len(created_session_ids) == 1:
