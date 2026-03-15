@@ -35,7 +35,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.responses import JSONResponse as _StarletteJSONResponse
-from starlette.routing import Mount as _StarletteMount
+from starlette.routing import Route as _StarletteRoute
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -711,10 +711,15 @@ def setup_mcp_server(app: FastAPI):
     app.include_router(mcp_router)
 
     # Mount Streamable HTTP transport (proxy-friendly, no persistent connection)
-    app.routes.insert(
-        0,
-        _StarletteMount(
-            "/mcp/{client_name}/http/{user_id}",
-            app=_streamable_http_app,
-        ),
-    )
+    for _path in (
+        "/mcp/{client_name}/http/{user_id}",
+        "/mcp/{client_name}/http/{user_id}/",
+    ):
+        app.routes.insert(
+            0,
+            _StarletteRoute(
+                _path,
+                endpoint=_streamable_http_app,
+                methods=["GET", "POST", "DELETE"],
+            ),
+        )
