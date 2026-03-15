@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from app.config import ALLOWED_ORIGINS, ALLOW_CREDENTIALS, DEFAULT_APP_ID, USER_ID
 from app.database import Base, SessionLocal, engine, get_database_state, set_database_state
-from app.mcp_server import get_streamable_manager, setup_mcp_server
+from app.mcp_server import StreamableHTTPMiddleware, get_streamable_manager, setup_mcp_server
 from app.models import App, User
 from app.routers import apps_router, backup_router, config_router, memories_router, stats_router
 from fastapi import FastAPI
@@ -159,3 +159,8 @@ app.include_router(backup_router)
 
 # Add pagination support
 add_pagination(app)
+
+# Wrap the entire ASGI app with StreamableHTTP middleware.
+# This intercepts /mcp/{client}/http/{user} BEFORE FastAPI routing,
+# so it is immune to FastAPI's internal route compilation.
+app = StreamableHTTPMiddleware(app)

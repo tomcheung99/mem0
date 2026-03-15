@@ -35,7 +35,12 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.responses import JSONResponse as _StarletteJSONResponse
-from starlette.routing import Route as _StarletteRoute
+
+import re as _re
+
+_STREAMABLE_HTTP_PATTERN = _re.compile(
+    r"^/mcp/(?P<client_name>[^/]+)/http/(?P<user_id>[^/]+)/?$"
+)
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -154,6 +159,22 @@ class _StreamableHTTPApp:
 
 
 _streamable_http_app = _StreamableHTTPApp()
+
+
+class StreamableHTTPMiddleware:
+    """ASGI middleware that intercepts /mcp/{client}/http/{user} before FastAPI routing."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            m = _STREAMABLE_HTTP_PATTERN.match(scope.get("path", ""))
+            if m:
+                scope["path_params"] = m.groupdict()
+                await _streamable_http_app(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 @mcp.tool(description="Add a new memory. This method is called everytime the user informs anything about themselves, their preferences, or anything that has any relevant information which can be useful in the future conversation. This can also be called when the user asks you to remember something.")
 async def add_memories(text: str, metadata: dict | None = None) -> str:
@@ -709,17 +730,3 @@ def setup_mcp_server(app: FastAPI):
 
     # Include MCP router in the FastAPI app (SSE endpoints)
     app.include_router(mcp_router)
-
-    # Mount Streamable HTTP transport (proxy-friendly, no persistent connection)
-    for _path in (
-        "/mcp/{client_name}/http/{user_id}",
-        "/mcp/{client_name}/http/{user_id}/",
-    ):
-        app.routes.insert(
-            0,
-            _StarletteRoute(
-                _path,
-                endpoint=_streamable_http_app,
-                methods=["GET", "POST", "DELETE"],
-            ),
-        )
