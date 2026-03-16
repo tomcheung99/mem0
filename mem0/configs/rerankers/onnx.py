@@ -15,8 +15,8 @@ class OnnxRerankerConfig(BaseRerankerConfig):
         description="The ONNX model to use for reranking",
     )
     quantization: Optional[str] = Field(
-        default="q8",
-        description="Quantization level to use (e.g., 'q8', 'q4', None for fp32)",
+        default="quantized",
+        description="Quantization level to use (e.g., 'quantized', 'int8', 'uint8', 'q4', 'fp16', None for fp32)",
     )
     max_length: int = Field(default=512, description="Maximum token length for tokenization")
     batch_size: int = Field(default=32, description="Batch size for processing documents")

@@ -291,7 +291,7 @@ def get_default_memory_config():
             "provider": "onnx",
             "config": {
                 "model": "onnx-community/bge-reranker-v2-m3-ONNX",
-                "quantization": "q8",
+                "quantization": "quantized",
                 "top_k": 10
             }
         },
