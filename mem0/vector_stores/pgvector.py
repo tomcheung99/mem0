@@ -226,7 +226,8 @@ class PGVector(VectorStoreBase):
                 filter_conditions.append("payload->>%s = %s")
                 filter_params.extend([k, str(v)])
 
-        filter_clause = "WHERE " + " AND ".join(filter_conditions) if filter_conditions else ""
+        filter_conditions.insert(0, "vector IS NOT NULL")
+        filter_clause = "WHERE " + " AND ".join(filter_conditions)
 
         with self._get_cursor() as cur:
             cur.execute(
@@ -241,7 +242,7 @@ class PGVector(VectorStoreBase):
             )
 
             results = cur.fetchall()
-        return [OutputData(id=str(r[0]), score=float(r[1]), payload=r[2]) for r in results]
+        return [OutputData(id=str(r[0]), score=float(r[1]), payload=r[2]) for r in results if r[1] is not None]
 
     def delete(self, vector_id: str) -> None:
         """
