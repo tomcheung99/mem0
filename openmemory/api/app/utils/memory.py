@@ -203,7 +203,7 @@ def get_default_memory_config():
             "host": pg_host,
             "port": int(pg_port),
             "connection_string": connection_string,
-            "embedding_model_dims": 1536,
+            "embedding_model_dims": 768,
             "minconn": 1,
             "maxconn": 2,  # Reduced for Railway compatibility
         }
@@ -219,7 +219,7 @@ def get_default_memory_config():
             "url": milvus_url,
             "token": os.environ.get('MILVUS_TOKEN', ''),  # Always include, empty string for local setup
             "db_name": os.environ.get('MILVUS_DB_NAME', ''),
-            "embedding_model_dims": 1536,
+            "embedding_model_dims": 768,
             "metric_type": "COSINE"  # Using COSINE for better semantic similarity
         }
     elif os.environ.get('ELASTICSEARCH_HOST') and os.environ.get('ELASTICSEARCH_PORT'):
@@ -237,7 +237,7 @@ def get_default_memory_config():
             "password": os.environ.get('ELASTICSEARCH_PASSWORD', 'changeme'),
             "verify_certs": False,
             "use_ssl": False,
-            "embedding_model_dims": 1536
+            "embedding_model_dims": 768
         })
     elif os.environ.get('OPENSEARCH_HOST') and os.environ.get('OPENSEARCH_PORT'):
         vector_store_provider = "opensearch"
@@ -250,7 +250,7 @@ def get_default_memory_config():
         vector_store_config = {
             "collection_name": "openmemory",
             "path": os.environ.get('FAISS_PATH'),
-            "embedding_model_dims": 1536,
+            "embedding_model_dims": 768,
             "distance_strategy": "cosine"
         }
     else:
@@ -275,17 +275,24 @@ def get_default_memory_config():
         "llm": {
             "provider": "openai",
             "config": {
-                "model": "gpt-4o-mini",
+                "model": "openai/gpt-oss-120b",
                 "temperature": 0.1,
                 "max_tokens": 2000,
                 "api_key": "env:OPENAI_API_KEY"
             }
         },
         "embedder": {
-            "provider": "openai",
+            "provider": "huggingface",
             "config": {
-                "model": "text-embedding-3-small",
-                "api_key": "env:OPENAI_API_KEY"
+                "model": "google/embeddinggemma-300m"
+            }
+        },
+        "reranker": {
+            "provider": "onnx",
+            "config": {
+                "model": "onnx-community/bge-reranker-v2-m3-ONNX",
+                "quantization": "q8",
+                "top_k": 10
             }
         },
         "version": "v1.1"

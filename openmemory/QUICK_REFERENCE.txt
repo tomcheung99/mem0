@@ -1,0 +1,212 @@
+═══════════════════════════════════════════════════════════════════════════════
+QUICK REFERENCE: OpenMemory App Configuration & Memory Creation
+═══════════════════════════════════════════════════════════════════════════════
+
+1. HOW APPS CONNECT TO OPENMEMORY
+   ═════════════════════════════════
+   
+   URL Pattern: http://openmemory:8765/mcp/{client_name}/http/{user_id}
+   
+   Example for nanobot:
+     - client_name = "nanobot" (the app identifier in OpenMemory)
+     - user_id = "Tom" (the user identifier)
+     - Full URL = http://localhost:8765/mcp/nanobot/http/Tom
+   
+   Transport: StreamableHTTP (MCP 1.0+ standard)
+   
+   Configuration (in nanobot/config.railway.json):
+   {
+     "tools": {
+       "mcpServers": {
+         "openmemory": {
+           "type": "streamableHttp",
+           "url": "http://127.0.0.1:8765/mcp/nanobot/http/Tom",
+           "headers": {
+             "Authorization": "Bearer <MCP_API_KEY>"
+           }
+         }
+       }
+     }
+   }
+
+2. MEMORY CREATION FLOW
+   ════════════════════
+   
+   Client calls → MCP add_memories tool
+        ↓
+   OpenMemory extracts client_name & user_id from URL
+        ↓
+   Calls get_user_and_app(db, user_id="Tom", app_id="nanobot")
+        ↓
+   Checks if app.is_active == True  ← 🔴 CRITICAL GATE
+        ↓
+   Sends to Mem0 (vector store)
+        ↓
+   Stores in database:
+     - Memory.user_id = user.id
+     - Memory.app_id = app.id  ← Links to app that created it
+     - Memory.metadata_ = {"source_app": "openmemory", "mcp_client": "nanobot"}
+        ↓
+   Returns created memory
+
+3. KEY FILES & LOCATIONS
+   ═══════════════════════
+   
+   API Routes:
+     - /api/v1/memories/ → /app/routers/memories.py:223
+     - Memory creation checks app.is_active at line 240
+   
+   MCP Server:
+     - /app/mcp_server.py
+     - add_memories tool: line 179
+     - search_memory tool: line 276
+   
+   Models:
+     - User, App, Memory: /app/models.py
+     - App.is_active field: line 60
+   
+   Utilities:
+     - get_user_and_app(): /app/utils/db.py:29
+     - User/app lookup logic
+   
+   Database:
+     - SQLite: /openmemory.db
+     - Tables: users, apps, memories, memory_access_logs
+
+4. WHY "VANE" ISN'T CREATING MEMORIES
+   ═════════════════════════════════════
+   
+   Most likely cause:
+   → App "vane" has is_active = False in database
+   
+   Check:
+   sqlite3 /Users/tomcheung/Project-2026/mem0/openmemory/api/openmemory.db
+   > SELECT id, name, is_active FROM apps WHERE name='vane';
+   
+   Fix:
+   > UPDATE apps SET is_active = TRUE WHERE name = 'vane';
+   
+   Other possible causes:
+   • Incorrect URL configuration (not matching /mcp/vane/http/{user_id})
+   • Missing API authentication header
+   • Network connectivity issue
+   • User doesn't exist in database
+   • Memory client (Mem0/Qdrant) is down
+   
+   Verify health:
+   curl http://localhost:8765/health
+
+5. APP REGISTRATION
+   ═════════════════
+   
+   Current registered apps:
+   • openmemory (default)
+   • nanobot (creating memories)
+   • vane (NOT creating memories)
+   
+   When an app makes its first MCP request:
+   1. OpenMemory auto-creates the app record (if doesn't exist)
+   2. Default: is_active = True
+   3. But if explicitly set to False, memory creation fails with 403
+   
+   To enable vane:
+   UPDATE apps SET is_active = TRUE WHERE name = 'vane';
+   
+   To disable an app:
+   UPDATE apps SET is_active = FALSE WHERE name = 'vane';
+
+6. MCP TOOLS EXPOSED
+   ══════════════════
+   
+   Tool 1: add_memories(text, metadata)
+   → Creates or updates a memory
+   → Requires: user_id and client_name from URL
+   → Checks: app.is_active
+   → Returns: Created memory details
+   
+   Tool 2: search_memory(query)
+   → Searches memories semantically
+   → Returns: Top 10 matching memories
+   → Logs: Access in memory_access_logs table
+
+7. METADATA ENRICHMENT
+   ════════════════════
+   
+   When nanobot creates memory:
+   Input metadata: {"key": "value"}
+   
+   Enriched metadata sent to Mem0:
+   {
+     "source_app": "openmemory",
+     "mcp_client": "nanobot",
+     "key": "value"
+   }
+   
+   Stored in database:
+   Memory.metadata_ = {"key": "value"}  (input only)
+
+8. DATABASE SCHEMA (RELEVANT FIELDS)
+   ════════════════════════════════════
+   
+   users:
+     - id (UUID, PK)
+     - user_id (String, UNIQUE) = "Tom"
+   
+   apps:
+     - id (UUID, PK)
+     - owner_id (UUID) → users.id
+     - name (String) = "nanobot", "vane"
+     - is_active (Boolean, DEFAULT=True) ← CRITICAL
+     - CONSTRAINT: UNIQUE(owner_id, name)
+   
+   memories:
+     - id (UUID, PK)
+     - user_id (UUID, FK) → users.id
+     - app_id (UUID, FK) → apps.id ← TRACKS SOURCE APP
+     - content (String)
+     - metadata_ (JSON)
+     - state (Enum)
+     - created_at, updated_at
+
+9. CONTEXT VARIABLES (HOW CLIENT_NAME IS TRACKED)
+   ═══════════════════════════════════════════════
+   
+   URL → /mcp/nanobot/http/Tom
+   ↓
+   Middleware regex extracts:
+     client_name = "nanobot"
+     user_id = "Tom"
+   ↓
+   Set in context variables:
+     user_id_var.set("Tom")
+     client_name_var.set("nanobot")
+   ↓
+   add_memories() retrieves:
+     uid = user_id_var.get()          → "Tom"
+     client_name = client_name_var.get()  → "nanobot"
+   ↓
+   get_user_and_app(db, user_id="Tom", app_id="nanobot")
+   ↓
+   Database lookup:
+     App.query.filter(owner_id=user.id, name="nanobot").first()
+   ↓
+   Result: Memory.app_id is set to that app's UUID
+
+10. API AUTHENTICATION (MCP_API_KEY)
+    ══════════════════════════════════
+    
+    If MCP_API_KEY is set in OpenMemory .env:
+    
+    Apps must include header:
+    Authorization: Bearer <MCP_API_KEY>
+    
+    In nanobot config:
+    {
+      "headers": {
+        "Authorization": "Bearer sk-xxx"
+      }
+    }
+    
+    If MCP_API_KEY is empty, auth is optional.
+
+═══════════════════════════════════════════════════════════════════════════════

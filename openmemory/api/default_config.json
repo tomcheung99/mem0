@@ -3,17 +3,24 @@
         "llm": {
             "provider": "openai",
             "config": {
-                "model": "gpt-4o-mini",
+                "model": "openai/gpt-oss-120b",
                 "temperature": 0.1,
                 "max_tokens": 2000,
                 "api_key": "env:OPENAI_API_KEY"
             }
         },
         "embedder": {
-            "provider": "openai",
+            "provider": "huggingface",
             "config": {
-                "model": "text-embedding-3-small",
-                "api_key": "env:OPENAI_API_KEY"
+                "model": "google/embeddinggemma-300m"
+            }
+        },
+        "reranker": {
+            "provider": "onnx",
+            "config": {
+                "model": "onnx-community/bge-reranker-v2-m3-ONNX",
+                "quantization": "q8",
+                "top_k": 10
             }
         }
     }

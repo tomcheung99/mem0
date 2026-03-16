@@ -29,6 +29,8 @@ def get_current_utc_time():
 
 class MemoryState(enum.Enum):
     active = "active"
+    pending = "pending"
+    merged = "merged"
     paused = "paused"
     archived = "archived"
     deleted = "deleted"
@@ -229,7 +231,9 @@ def categorize_memory(memory: Memory, db: Session) -> None:
 
 @event.listens_for(Memory, 'after_insert')
 def after_memory_insert(mapper, connection, target):
-    """Trigger categorization after a memory is inserted."""
+    """Trigger categorization after a memory is inserted (skip for pending candidates)."""
+    if target.state == MemoryState.pending:
+        return
     db = Session(bind=connection)
     categorize_memory(target, db)
     db.close()
@@ -237,7 +241,9 @@ def after_memory_insert(mapper, connection, target):
 
 @event.listens_for(Memory, 'after_update')
 def after_memory_update(mapper, connection, target):
-    """Trigger categorization after a memory is updated."""
+    """Trigger categorization after a memory is updated (skip for pending candidates)."""
+    if target.state == MemoryState.pending:
+        return
     db = Session(bind=connection)
     categorize_memory(target, db)
     db.close()

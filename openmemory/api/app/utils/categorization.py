@@ -29,6 +29,9 @@ class MemoryCategories(BaseModel):
     categories: List[str]
 
 
+CATEGORIZATION_MODEL = os.getenv("CATEGORIZATION_MODEL", "openai/gpt-oss-20b")
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=15))
 def get_categories_for_memory(memory: str) -> List[str]:
     try:
@@ -40,7 +43,7 @@ def get_categories_for_memory(memory: str) -> List[str]:
 
         # Let OpenAI handle the pydantic parsing directlys
         completion = openai_client.beta.chat.completions.parse(
-            model="gpt-4o-mini",
+            model=CATEGORIZATION_MODEL,
             messages=messages,
             response_format=MemoryCategories,
             temperature=0

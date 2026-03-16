@@ -228,11 +228,11 @@ async def add_memories(text: str, metadata: dict | None = None) -> str:
                                 app_id=app.id,
                                 content=result['memory'],
                                 metadata_=metadata or {},
-                                state=MemoryState.active
+                                state=MemoryState.pending
                             )
                             db.add(memory)
                         else:
-                            memory.state = MemoryState.active
+                            memory.state = MemoryState.pending
                             memory.content = result['memory']
 
                         # Create history entry
@@ -240,15 +240,25 @@ async def add_memories(text: str, metadata: dict | None = None) -> str:
                             memory_id=memory_id,
                             changed_by=user.id,
                             old_state=MemoryState.deleted if memory else None,
-                            new_state=MemoryState.active
+                            new_state=MemoryState.pending
                         )
                         db.add(history)
 
                     elif result['event'] == 'UPDATE':
+                        old_state = memory.state if memory else None
                         if memory:
                             memory.content = result['memory']
+                            memory.state = MemoryState.pending
                             if metadata:
                                 memory.metadata_ = {**(memory.metadata_ or {}), **metadata}
+                            # Track state transition
+                            history = MemoryStatusHistory(
+                                memory_id=memory_id,
+                                changed_by=user.id,
+                                old_state=old_state,
+                                new_state=MemoryState.pending
+                            )
+                            db.add(history)
 
                     elif result['event'] == 'DELETE':
                         if memory:
@@ -330,8 +340,16 @@ async def search_memory(query: str) -> str:
                     "score": score,
                 })
 
-            # Keep top 10 after ACL filtering
-            results = results[:10]
+            # Apply reranking if the memory client has a reranker configured
+            if hasattr(memory_client, "reranker") and memory_client.reranker and results:
+                try:
+                    results = memory_client.reranker.rerank(query, results, top_k=10)
+                except Exception as rerank_err:
+                    logging.warning("Reranking failed, using vector score order: %s", rerank_err)
+                    results = results[:10]
+            else:
+                # Keep top 10 after ACL filtering
+                results = results[:10]
 
             for r in results: 
                 if r.get("id"): 
@@ -356,7 +374,7 @@ async def search_memory(query: str) -> str:
         return f"Error searching memory: {e}"
 
 
-@mcp.tool(description="List all memories in the user's memory")
+# Backend-only: not exposed as MCP tool, managed via OpenMemory UI/API
 async def list_memories() -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
@@ -427,7 +445,7 @@ async def list_memories() -> str:
         return f"Error getting memories: {e}"
 
 
-@mcp.tool(description="Delete specific memories by their IDs")
+# Backend-only: not exposed as MCP tool, managed via OpenMemory UI/API
 async def delete_memories(memory_ids: list[str]) -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
@@ -472,6 +490,7 @@ async def delete_memories(memory_ids: list[str]) -> str:
             for memory_id in ids_to_delete:
                 memory = db.query(Memory).filter(Memory.id == memory_id).first()
                 if memory:
+                    old_state = memory.state
                     # Update memory state
                     memory.state = MemoryState.deleted
                     memory.deleted_at = now
@@ -480,7 +499,7 @@ async def delete_memories(memory_ids: list[str]) -> str:
                     history = MemoryStatusHistory(
                         memory_id=memory_id,
                         changed_by=user.id,
-                        old_state=MemoryState.active,
+                        old_state=old_state,
                         new_state=MemoryState.deleted
                     )
                     db.add(history)
@@ -503,7 +522,7 @@ async def delete_memories(memory_ids: list[str]) -> str:
         return f"Error deleting memories: {e}"
 
 
-@mcp.tool()
+# Backend-only: not exposed as MCP tool, managed via OpenMemory UI/API
 def update_memory(memory_id: str, new_content: str) -> str:
     """Update an existing memory's content. Re-embeds in vector store and syncs SQL.
 
@@ -530,7 +549,7 @@ def update_memory(memory_id: str, new_content: str) -> str:
             # Find memory and check ownership
             memory = db.query(Memory).filter(
                 Memory.id == parsed_id,
-                Memory.state == MemoryState.active
+                Memory.state.in_([MemoryState.active, MemoryState.pending])
             ).first()
             if not memory:
                 return f"Memory {memory_id} not found or already deleted"
@@ -730,3 +749,19 @@ def setup_mcp_server(app: FastAPI):
 
     # Include MCP router in the FastAPI app (SSE endpoints)
     app.include_router(mcp_router)
+
+    # Consolidation endpoint (cron / manual trigger)
+    @app.post("/api/v1/consolidate/{user_id}")
+    async def trigger_consolidation(user_id: str):
+        from app.utils.consolidation import consolidate_user_memories
+
+        memory_client = get_memory_client_safe()
+        if not memory_client:
+            return {"error": "Memory system unavailable"}
+
+        db = SessionLocal()
+        try:
+            stats = consolidate_user_memories(user_id, db, memory_client)
+            return {"status": "ok", "stats": stats}
+        finally:
+            db.close()
