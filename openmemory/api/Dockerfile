@@ -10,6 +10,7 @@ RUN pip install -r requirements.txt
 
 # Install local mem0 source to override PyPI version (includes onnx reranker etc.)
 COPY pyproject.toml /tmp/mem0_src/pyproject.toml
+COPY README.md /tmp/mem0_src/README.md
 COPY mem0/ /tmp/mem0_src/mem0/
 RUN pip install /tmp/mem0_src/ && rm -rf /tmp/mem0_src/
 
