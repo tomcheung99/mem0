@@ -8,20 +8,31 @@ import os
 import uuid
 import warnings
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 import pytz
 from pydantic import ValidationError
 
 from mem0.configs.base import MemoryConfig, MemoryItem
-from mem0.configs.enums import MemoryType
+from mem0.configs.enums import MemoryTier, MemoryType
 from mem0.configs.prompts import (
     PROCEDURAL_MEMORY_SYSTEM_PROMPT,
+    TRUST_SCORING_PROMPT,
+    get_conflict_aware_update_memory_messages,
     get_update_memory_messages,
 )
 from mem0.exceptions import ValidationError as Mem0ValidationError
 from mem0.memory.base import MemoryBase
+from mem0.memory.cleanup import (
+    apply_temporal_decay,
+    build_compaction_prompt,
+    compute_expires_at,
+    compute_memory_entropy,
+    compute_tier_ttl,
+    is_gc_eligible,
+    is_memory_expired,
+)
 from mem0.memory.setup import mem0_dir, setup_config
 from mem0.memory.storage import SQLiteManager
 from mem0.memory.telemetry import capture_event
@@ -458,6 +469,11 @@ class Memory(MemoryBase):
         if not new_retrieved_facts:
             logger.debug("No new facts retrieved from input. Skipping memory update LLM call.")
 
+        # ── Trust Scoring: evaluate importance of each extracted fact ──
+        trust_scores_map = {}
+        if new_retrieved_facts and self.config.trust_scoring.enabled:
+            trust_scores_map = self._score_facts(new_retrieved_facts)
+
         retrieved_old_memory = []
         new_message_embeddings = {}
         # Search for existing memories using the provided session identifiers
@@ -494,9 +510,15 @@ class Memory(MemoryBase):
             retrieved_old_memory[idx]["id"] = str(idx)
 
         if new_retrieved_facts:
-            function_calling_prompt = get_update_memory_messages(
-                retrieved_old_memory, new_retrieved_facts, self.config.custom_update_memory_prompt
-            )
+            # Use conflict-aware prompt when conflict resolution is enabled
+            if self.config.conflict_resolution.enabled:
+                function_calling_prompt = get_conflict_aware_update_memory_messages(
+                    retrieved_old_memory, new_retrieved_facts, self.config.custom_update_memory_prompt
+                )
+            else:
+                function_calling_prompt = get_update_memory_messages(
+                    retrieved_old_memory, new_retrieved_facts, self.config.custom_update_memory_prompt
+                )
 
             try:
                 response: str = self.llm.generate_response(
@@ -531,13 +553,29 @@ class Memory(MemoryBase):
                         continue
 
                     event_type = resp.get("event")
+
+                    # ── Attach trust score and tier to metadata for ADD ──
+                    action_metadata = deepcopy(metadata)
+                    if self.config.trust_scoring.enabled and event_type in ("ADD", "CONFLICT"):
+                        fact_score = trust_scores_map.get(action_text, 0.5)
+                        action_metadata["trust_score"] = fact_score
+                        if fact_score < self.config.trust_scoring.archive_threshold:
+                            action_metadata["memory_tier"] = MemoryTier.ARCHIVED.value
+                            logger.info(f"Low trust score ({fact_score:.2f}), archiving memory: {action_text[:60]}")
+
                     if event_type == "ADD":
                         memory_id = self._create_memory(
                             data=action_text,
                             existing_embeddings=new_message_embeddings,
-                            metadata=deepcopy(metadata),
+                            metadata=action_metadata,
                         )
-                        returned_memories.append({"id": memory_id, "memory": action_text, "event": event_type})
+                        returned_memories.append({
+                            "id": memory_id,
+                            "memory": action_text,
+                            "event": event_type,
+                            "trust_score": action_metadata.get("trust_score"),
+                            "memory_tier": action_metadata.get("memory_tier"),
+                        })
                     elif event_type == "UPDATE":
                         self._update_memory(
                             memory_id=temp_uuid_mapping[resp.get("id")],
@@ -562,6 +600,56 @@ class Memory(MemoryBase):
                                 "event": event_type,
                             }
                         )
+                    elif event_type == "CONFLICT":
+                        # Handle memory conflicts
+                        conflicting_memory_id = temp_uuid_mapping.get(resp.get("id"))
+                        conflict_action = self.config.conflict_resolution.contradiction_action
+
+                        if conflict_action == "auto_resolve" and conflicting_memory_id:
+                            # Keep newer fact, demote older
+                            existing_memory = self.vector_store.get(vector_id=conflicting_memory_id)
+                            if existing_memory:
+                                old_payload = deepcopy(existing_memory.payload)
+                                old_payload["memory_tier"] = MemoryTier.ARCHIVED.value
+                                old_payload["conflict_superseded_by"] = action_text
+                                old_payload["updated_at"] = datetime.now(pytz.timezone("US/Pacific")).isoformat()
+                                self.vector_store.update(
+                                    vector_id=conflicting_memory_id,
+                                    vector=None,
+                                    payload=old_payload,
+                                )
+                            # Add the new fact
+                            memory_id = self._create_memory(
+                                data=action_text,
+                                existing_embeddings=new_message_embeddings,
+                                metadata=action_metadata,
+                            )
+                            returned_memories.append({
+                                "id": memory_id,
+                                "memory": action_text,
+                                "event": "CONFLICT_RESOLVED",
+                                "previous_memory": resp.get("old_memory"),
+                                "conflict_type": resp.get("conflict_type"),
+                                "superseded_id": conflicting_memory_id,
+                            })
+                        else:
+                            # Flag mode: add the new fact with conflict metadata
+                            action_metadata["conflict_with"] = conflicting_memory_id
+                            action_metadata["conflict_type"] = resp.get("conflict_type", "unknown")
+                            action_metadata["conflict_resolved"] = False
+                            memory_id = self._create_memory(
+                                data=action_text,
+                                existing_embeddings=new_message_embeddings,
+                                metadata=action_metadata,
+                            )
+                            returned_memories.append({
+                                "id": memory_id,
+                                "memory": action_text,
+                                "event": "CONFLICT_FLAGGED",
+                                "previous_memory": resp.get("old_memory"),
+                                "conflict_type": resp.get("conflict_type"),
+                                "conflict_with": conflicting_memory_id,
+                            })
                     elif event_type == "NONE":
                         # Even if content doesn't need updating, update session IDs if provided
                         memory_id = temp_uuid_mapping.get(resp.get("id"))
@@ -630,7 +718,8 @@ class Memory(MemoryBase):
             "role",
         ]
 
-        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", *promoted_payload_keys}
+        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id",
+                                  "trust_score", "memory_tier", *promoted_payload_keys}
 
         result_item = MemoryItem(
             id=memory.id,
@@ -638,6 +727,8 @@ class Memory(MemoryBase):
             hash=memory.payload.get("hash"),
             created_at=memory.payload.get("created_at"),
             updated_at=memory.payload.get("updated_at"),
+            trust_score=memory.payload.get("trust_score"),
+            memory_tier=memory.payload.get("memory_tier"),
         ).model_dump()
 
         for key in promoted_payload_keys:
@@ -731,7 +822,8 @@ class Memory(MemoryBase):
             "actor_id",
             "role",
         ]
-        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", *promoted_payload_keys}
+        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id",
+                                  "trust_score", "memory_tier", *promoted_payload_keys}
 
         formatted_memories = []
         for mem in actual_memories:
@@ -741,6 +833,8 @@ class Memory(MemoryBase):
                 hash=mem.payload.get("hash"),
                 created_at=mem.payload.get("created_at"),
                 updated_at=mem.payload.get("updated_at"),
+                trust_score=mem.payload.get("trust_score"),
+                memory_tier=mem.payload.get("memory_tier"),
             ).model_dump(exclude={"score"})
 
             for key in promoted_payload_keys:
@@ -963,10 +1057,23 @@ class Memory(MemoryBase):
             "role",
         ]
 
-        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", *promoted_payload_keys}
+        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id",
+                                  "expires_at", "access_count", "last_accessed_at",
+                                  "trust_score", "memory_tier",
+                                  *promoted_payload_keys}
+
+        ttl_cfg = self.config.cleanup.ttl
+        gc_cfg = self.config.cleanup.garbage_collection
+        expired_ids = []
 
         original_memories = []
         for mem in memories:
+            # ── TTL: skip & mark expired memories ──
+            if ttl_cfg.enabled and is_memory_expired(mem.payload):
+                if ttl_cfg.auto_purge_on_search:
+                    expired_ids.append(mem.id)
+                continue
+
             memory_item_dict = MemoryItem(
                 id=mem.id,
                 memory=mem.payload.get("data", ""),
@@ -974,6 +1081,8 @@ class Memory(MemoryBase):
                 created_at=mem.payload.get("created_at"),
                 updated_at=mem.payload.get("updated_at"),
                 score=mem.score,
+                trust_score=mem.payload.get("trust_score"),
+                memory_tier=mem.payload.get("memory_tier"),
             ).model_dump()
 
             for key in promoted_payload_keys:
@@ -986,6 +1095,24 @@ class Memory(MemoryBase):
 
             if threshold is None or mem.score >= threshold:
                 original_memories.append(memory_item_dict)
+
+        # ── Temporal Decay ──
+        decay_cfg = self.config.cleanup.temporal_decay
+        if decay_cfg.enabled and original_memories:
+            apply_temporal_decay(original_memories, decay_cfg.decay_rate, decay_cfg.time_field)
+
+        # ── Async TTL purge of expired entries discovered above ──
+        if expired_ids:
+            for eid in expired_ids:
+                try:
+                    self._delete_memory(eid)
+                    logger.info(f"TTL purge: deleted expired memory {eid}")
+                except Exception as e:
+                    logger.warning(f"TTL purge failed for {eid}: {e}")
+
+        # ── GC: track access on returned memories ──
+        if gc_cfg.enabled:
+            self._track_access(original_memories)
 
         return original_memories
 
@@ -1083,6 +1210,36 @@ class Memory(MemoryBase):
         metadata["data"] = data
         metadata["hash"] = hashlib.md5(data.encode()).hexdigest()
         metadata["created_at"] = datetime.now(pytz.timezone("US/Pacific")).isoformat()
+
+        # ── Hierarchical Memory: assign tier if not already set ──
+        hier_cfg = self.config.hierarchical_memory
+        if hier_cfg.enabled and "memory_tier" not in metadata:
+            if metadata.get("run_id"):
+                metadata["memory_tier"] = MemoryTier.WORKING.value
+            elif metadata.get("agent_id"):
+                metadata["memory_tier"] = MemoryTier.SESSION.value
+            else:
+                metadata["memory_tier"] = MemoryTier.LONG_TERM.value
+
+        # ── TTL: stamp expiration if configured and not already set ──
+        ttl_cfg = self.config.cleanup.ttl
+        if ttl_cfg.enabled and "expires_at" not in metadata and ttl_cfg.default_ttl_seconds is not None:
+            metadata["expires_at"] = compute_expires_at(ttl_cfg.default_ttl_seconds)
+
+        # ── Proactive Forgetting: apply tier-based TTL ──
+        pf_cfg = self.config.cleanup.proactive_forgetting
+        if pf_cfg.enabled and "expires_at" not in metadata:
+            tier = metadata.get("memory_tier")
+            if tier:
+                tier_expires = compute_tier_ttl(tier, pf_cfg.tier_ttl_seconds)
+                if tier_expires:
+                    metadata["expires_at"] = tier_expires
+
+        # ── GC: initialise access tracking fields ──
+        gc_cfg = self.config.cleanup.garbage_collection
+        if gc_cfg.enabled:
+            metadata.setdefault("access_count", 0)
+            metadata.setdefault("last_accessed_at", metadata["created_at"])
 
         self.vector_store.insert(
             vectors=[embeddings],
@@ -1208,6 +1365,393 @@ class Memory(MemoryBase):
             is_deleted=1,
         )
         return memory_id
+
+    def _score_facts(self, facts: list) -> Dict[str, float]:
+        """
+        Use LLM to score each extracted fact for trust/importance.
+
+        Args:
+            facts: List of fact strings to score.
+
+        Returns:
+            Dict mapping fact text → trust score (0.0-1.0).
+        """
+        trust_cfg = self.config.trust_scoring
+        prompt_template = trust_cfg.scoring_prompt or TRUST_SCORING_PROMPT
+        facts_text = "\n".join(f"- {f}" for f in facts)
+        prompt = prompt_template.format(facts=facts_text)
+
+        try:
+            response = self.llm.generate_response(
+                messages=[
+                    {"role": "system", "content": "You are an expert memory evaluator."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+            response = remove_code_blocks(response)
+            scored = json.loads(response).get("scored_facts", [])
+            return {item["text"]: float(item["score"]) for item in scored if "text" in item and "score" in item}
+        except Exception as e:
+            logger.warning(f"Trust scoring failed, using default scores: {e}")
+            return {f: 0.5 for f in facts}
+
+    # ── Hierarchical Memory & Forgetting public API ────────────────
+
+    def promote_session_memories(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """
+        Promote high-value working/session memories to long-term storage.
+
+        Summarizes session memories via LLM and promotes those exceeding
+        the promotion threshold to long-term tier.
+
+        Args:
+            user_id, agent_id, run_id: Scope the promotion.
+            limit: Max memories to process.
+
+        Returns:
+            dict: ``{"promoted": <int>, "archived": <int>, "summary_ids": [...]}``
+        """
+        hier_cfg = self.config.hierarchical_memory
+        _, effective_filters = _build_filters_and_metadata(
+            user_id=user_id, agent_id=agent_id, run_id=run_id,
+        )
+
+        memories_result = self.vector_store.list(filters=effective_filters, limit=limit)
+        actual_memories = memories_result[0] if (isinstance(memories_result, (list, tuple))
+                                                 and memories_result
+                                                 and isinstance(memories_result[0], (list, tuple))) else memories_result
+
+        # Filter to working and session tier memories
+        eligible = [
+            m for m in actual_memories
+            if m.payload.get("memory_tier") in (MemoryTier.WORKING.value, MemoryTier.SESSION.value)
+        ]
+
+        if not eligible:
+            return {"promoted": 0, "archived": 0, "summary_ids": []}
+
+        # Build summaries using compaction infrastructure
+        batch_dicts = [{"id": m.id, "memory": m.payload.get("data", "")} for m in eligible]
+        compaction_prompt = build_compaction_prompt(batch_dicts)
+
+        try:
+            response = self.llm.generate_response(
+                messages=[
+                    {"role": "system", "content": "You are a knowledge curator."},
+                    {"role": "user", "content": compaction_prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+            response = remove_code_blocks(response)
+            try:
+                summaries = json.loads(response).get("summaries", [])
+            except json.JSONDecodeError:
+                summaries = json.loads(extract_json(response)).get("summaries", [])
+        except Exception as e:
+            logger.error(f"promote_session_memories: LLM summarization failed: {e}")
+            return {"promoted": 0, "archived": 0, "summary_ids": []}
+
+        # Score the summaries for trust
+        trust_scores = {}
+        if self.config.trust_scoring.enabled and summaries:
+            trust_scores = self._score_facts(summaries)
+
+        promoted = 0
+        archived = 0
+        summary_ids = []
+        base_metadata = deepcopy(effective_filters)
+
+        for summary_text in summaries:
+            if not summary_text or not summary_text.strip():
+                continue
+            score = trust_scores.get(summary_text, 0.5)
+            meta = deepcopy(base_metadata)
+            meta["trust_score"] = score
+
+            if score >= hier_cfg.promotion_threshold:
+                meta["memory_tier"] = MemoryTier.LONG_TERM.value
+                promoted += 1
+            else:
+                meta["memory_tier"] = MemoryTier.ARCHIVED.value
+                archived += 1
+
+            emb = self.embedding_model.embed(summary_text, "add")
+            mid = self._create_memory(summary_text, {summary_text: emb}, metadata=meta)
+            summary_ids.append(mid)
+
+        # Delete original working/session memories
+        for mem in eligible:
+            try:
+                self._delete_memory(mem.id)
+            except Exception as e:
+                logger.warning(f"promote_session_memories: failed to delete {mem.id}: {e}")
+
+        logger.info(f"promote_session_memories: promoted={promoted}, archived={archived}")
+        return {"promoted": promoted, "archived": archived, "summary_ids": summary_ids}
+
+    def entropy_report(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """
+        Compute and return the memory entropy metrics.
+
+        Entropy measures the noise ratio of recently accumulated memories.
+        High entropy indicates many low-quality memories are being stored.
+
+        Args:
+            user_id, agent_id, run_id: Scope the analysis.
+            limit: Max memories to scan.
+
+        Returns:
+            dict: ``{"entropy": float, "total_in_window": int, "low_trust_count": int,
+                     "avg_trust_score": float, "needs_cleanup": bool}``
+        """
+        pf_cfg = self.config.cleanup.proactive_forgetting
+        _, effective_filters = _build_filters_and_metadata(
+            user_id=user_id, agent_id=agent_id, run_id=run_id,
+        )
+
+        memories_result = self.vector_store.list(filters=effective_filters, limit=limit)
+        actual_memories = memories_result[0] if (isinstance(memories_result, (list, tuple))
+                                                 and memories_result
+                                                 and isinstance(memories_result[0], (list, tuple))) else memories_result
+
+        memory_dicts = [
+            {
+                "created_at": m.payload.get("created_at"),
+                "updated_at": m.payload.get("updated_at"),
+                "trust_score": m.payload.get("trust_score", 0.5),
+            }
+            for m in actual_memories
+        ]
+
+        report = compute_memory_entropy(memory_dicts, pf_cfg.entropy_window_hours)
+        report["needs_cleanup"] = report["entropy"] >= pf_cfg.entropy_threshold
+        return report
+
+    # ── Cleanup public API ─────────────────────────────────────────
+
+    def purge_expired(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """
+        Scan and delete all memories whose TTL has expired.
+
+        Args:
+            user_id, agent_id, run_id: Scope the scan to a specific session.
+            limit: Maximum number of memories to scan per call.
+
+        Returns:
+            dict: ``{"deleted": <int>, "scanned": <int>}``
+        """
+        _, effective_filters = _build_filters_and_metadata(
+            user_id=user_id, agent_id=agent_id, run_id=run_id
+        )
+        memories_result = self.vector_store.list(filters=effective_filters, limit=limit)
+        actual_memories = memories_result[0] if (isinstance(memories_result, (list, tuple))
+                                                 and memories_result
+                                                 and isinstance(memories_result[0], (list, tuple))) else memories_result
+
+        deleted = 0
+        for mem in actual_memories:
+            if is_memory_expired(mem.payload):
+                try:
+                    self._delete_memory(mem.id)
+                    deleted += 1
+                except Exception as e:
+                    logger.warning(f"purge_expired: failed to delete {mem.id}: {e}")
+
+        logger.info(f"purge_expired: deleted {deleted}/{len(actual_memories)} memories")
+        return {"deleted": deleted, "scanned": len(actual_memories)}
+
+    def compact_memories(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        limit: int = 100,
+        batch_size: Optional[int] = None,
+        preserve_recent_hours: Optional[float] = None,
+        prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Summarise many fine-grained memories into dense knowledge blocks using an LLM.
+
+        Memories newer than ``preserve_recent_hours`` are left untouched.
+        Older memories are grouped into batches, summarised, and the originals deleted.
+
+        Args:
+            user_id, agent_id, run_id: Scope the compaction to a specific session.
+            limit: Max memories to fetch for compaction.
+            batch_size: Memories per LLM summarisation call. Falls back to config.
+            preserve_recent_hours: Skip memories newer than this. Falls back to config.
+            prompt: Custom LLM prompt. Falls back to config, then default.
+
+        Returns:
+            dict: ``{"compacted": <int>, "created": <int>, "summary_ids": [...]}``
+        """
+        compact_cfg = self.config.cleanup.compaction
+        batch_size = batch_size or compact_cfg.summary_batch_size
+        preserve_recent_hours = preserve_recent_hours if preserve_recent_hours is not None else compact_cfg.preserve_recent_hours
+        prompt_template = prompt or compact_cfg.summary_prompt
+
+        _, effective_filters = _build_filters_and_metadata(
+            user_id=user_id, agent_id=agent_id, run_id=run_id,
+        )
+
+        memories_result = self.vector_store.list(filters=effective_filters, limit=limit)
+        actual_memories = memories_result[0] if (isinstance(memories_result, (list, tuple))
+                                                 and memories_result
+                                                 and isinstance(memories_result[0], (list, tuple))) else memories_result
+
+        # Filter out recent memories
+        cutoff = datetime.now(pytz.timezone("US/Pacific")) - timedelta(hours=preserve_recent_hours)
+        eligible = []
+        for mem in actual_memories:
+            ts_str = mem.payload.get("updated_at") or mem.payload.get("created_at")
+            if ts_str:
+                try:
+                    ts = datetime.fromisoformat(ts_str)
+                    if ts.tzinfo is None:
+                        ts = pytz.timezone("US/Pacific").localize(ts)
+                    if ts < cutoff:
+                        eligible.append(mem)
+                except (ValueError, TypeError):
+                    eligible.append(mem)
+            else:
+                eligible.append(mem)
+
+        if not eligible:
+            return {"compacted": 0, "created": 0, "summary_ids": []}
+
+        # Process in batches
+        compacted_total = 0
+        summary_ids = []
+        base_metadata = deepcopy(effective_filters)
+
+        for i in range(0, len(eligible), batch_size):
+            batch = eligible[i : i + batch_size]
+            batch_dicts = [
+                {"id": m.id, "memory": m.payload.get("data", "")} for m in batch
+            ]
+
+            compaction_prompt = build_compaction_prompt(batch_dicts, prompt_template)
+            try:
+                response = self.llm.generate_response(
+                    messages=[
+                        {"role": "system", "content": "You are a knowledge curator."},
+                        {"role": "user", "content": compaction_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                )
+                from mem0.memory.utils import remove_code_blocks, extract_json
+                response = remove_code_blocks(response)
+                try:
+                    summaries = json.loads(response).get("summaries", [])
+                except json.JSONDecodeError:
+                    summaries = json.loads(extract_json(response)).get("summaries", [])
+            except Exception as e:
+                logger.error(f"compact_memories: LLM call failed for batch {i}: {e}")
+                continue
+
+            # Delete originals
+            for mem in batch:
+                try:
+                    self._delete_memory(mem.id)
+                    compacted_total += 1
+                except Exception as e:
+                    logger.warning(f"compact_memories: failed to delete {mem.id}: {e}")
+
+            # Insert summaries
+            for summary_text in summaries:
+                if not summary_text or not summary_text.strip():
+                    continue
+                emb = self.embedding_model.embed(summary_text, "add")
+                meta = deepcopy(base_metadata)
+                mid = self._create_memory(summary_text, {summary_text: emb}, metadata=meta)
+                summary_ids.append(mid)
+
+        logger.info(f"compact_memories: compacted {compacted_total} into {len(summary_ids)} summaries")
+        return {"compacted": compacted_total, "created": len(summary_ids), "summary_ids": summary_ids}
+
+    def garbage_collect(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Remove memories that are idle (not accessed recently) and have low access counts.
+
+        Args:
+            user_id, agent_id, run_id: Scope the GC scan.
+            limit: Max memories to scan. Falls back to config ``batch_size``.
+
+        Returns:
+            dict: ``{"deleted": <int>, "scanned": <int>}``
+        """
+        gc_cfg = self.config.cleanup.garbage_collection
+        limit = limit or gc_cfg.batch_size
+
+        _, effective_filters = _build_filters_and_metadata(
+            user_id=user_id, agent_id=agent_id, run_id=run_id,
+        )
+
+        memories_result = self.vector_store.list(filters=effective_filters, limit=limit)
+        actual_memories = memories_result[0] if (isinstance(memories_result, (list, tuple))
+                                                 and memories_result
+                                                 and isinstance(memories_result[0], (list, tuple))) else memories_result
+
+        deleted = 0
+        for mem in actual_memories:
+            if is_gc_eligible(mem.payload, gc_cfg.min_idle_days, gc_cfg.min_access_count):
+                try:
+                    self._delete_memory(mem.id)
+                    deleted += 1
+                except Exception as e:
+                    logger.warning(f"garbage_collect: failed to delete {mem.id}: {e}")
+
+        logger.info(f"garbage_collect: deleted {deleted}/{len(actual_memories)} memories")
+        return {"deleted": deleted, "scanned": len(actual_memories)}
+
+    def _track_access(self, memories: list):
+        """
+        Increment ``access_count`` and update ``last_accessed_at`` for each memory
+        returned from a search. Runs as a best-effort background update.
+        """
+        now_str = datetime.now(pytz.timezone("US/Pacific")).isoformat()
+        for mem in memories:
+            try:
+                existing = self.vector_store.get(vector_id=mem["id"])
+                if existing is None:
+                    continue
+                payload = deepcopy(existing.payload)
+                payload["access_count"] = payload.get("access_count", 0) + 1
+                payload["last_accessed_at"] = now_str
+                self.vector_store.update(vector_id=mem["id"], payload=payload)
+            except Exception as e:
+                logger.debug(f"_track_access: failed for {mem.get('id')}: {e}")
 
     def reset(self):
         """
@@ -1481,6 +2025,11 @@ class AsyncMemory(MemoryBase):
             logger.error(f"Error in new_retrieved_facts: {e}")
             new_retrieved_facts = []
 
+        # ── Trust Scoring: evaluate importance of each extracted fact ──
+        trust_scores_map = {}
+        if new_retrieved_facts and self.config.trust_scoring.enabled:
+            trust_scores_map = await asyncio.to_thread(self._score_facts, new_retrieved_facts)
+
         if not new_retrieved_facts:
             logger.debug("No new facts retrieved from input. Skipping memory update LLM call.")
 
@@ -1524,9 +2073,14 @@ class AsyncMemory(MemoryBase):
             retrieved_old_memory[idx]["id"] = str(idx)
 
         if new_retrieved_facts:
-            function_calling_prompt = get_update_memory_messages(
-                retrieved_old_memory, new_retrieved_facts, self.config.custom_update_memory_prompt
-            )
+            if self.config.conflict_resolution.enabled:
+                function_calling_prompt = get_conflict_aware_update_memory_messages(
+                    retrieved_old_memory, new_retrieved_facts, self.config.custom_update_memory_prompt
+                )
+            else:
+                function_calling_prompt = get_update_memory_messages(
+                    retrieved_old_memory, new_retrieved_facts, self.config.custom_update_memory_prompt
+                )
             try:
                 response = await asyncio.to_thread(
                     self.llm.generate_response,
@@ -1561,14 +2115,49 @@ class AsyncMemory(MemoryBase):
                     event_type = resp.get("event")
 
                     if event_type == "ADD":
+                        action_metadata = deepcopy(metadata)
+                        if self.config.trust_scoring.enabled and event_type in ("ADD", "CONFLICT"):
+                            fact_score = trust_scores_map.get(action_text, 0.5)
+                            action_metadata["trust_score"] = fact_score
+                            if fact_score < self.config.trust_scoring.archive_threshold:
+                                action_metadata["memory_tier"] = MemoryTier.ARCHIVED.value
                         task = asyncio.create_task(
                             self._create_memory(
                                 data=action_text,
                                 existing_embeddings=new_message_embeddings,
-                                metadata=deepcopy(metadata),
+                                metadata=action_metadata,
                             )
                         )
                         memory_tasks.append((task, resp, "ADD", None))
+                    elif event_type == "CONFLICT":
+                        action_metadata = deepcopy(metadata)
+                        if self.config.trust_scoring.enabled:
+                            fact_score = trust_scores_map.get(action_text, 0.5)
+                            action_metadata["trust_score"] = fact_score
+                            if fact_score < self.config.trust_scoring.archive_threshold:
+                                action_metadata["memory_tier"] = MemoryTier.ARCHIVED.value
+                        conflicting_memory_id = temp_uuid_mapping.get(resp.get("id"))
+                        conflict_action = self.config.conflict_resolution.contradiction_action
+                        if conflict_action == "auto_resolve" and conflicting_memory_id:
+                            existing_memory = await asyncio.to_thread(self.vector_store.get, vector_id=conflicting_memory_id)
+                            if existing_memory:
+                                old_payload = deepcopy(existing_memory.payload)
+                                old_payload["memory_tier"] = MemoryTier.ARCHIVED.value
+                                old_payload["conflict_superseded_by"] = action_text
+                                old_payload["updated_at"] = datetime.now(pytz.timezone("US/Pacific")).isoformat()
+                                await asyncio.to_thread(self.vector_store.update, vector_id=conflicting_memory_id, vector=None, payload=old_payload)
+                            task = asyncio.create_task(
+                                self._create_memory(data=action_text, existing_embeddings=new_message_embeddings, metadata=action_metadata)
+                            )
+                            memory_tasks.append((task, resp, "CONFLICT_RESOLVED", None))
+                        else:
+                            action_metadata["conflict_with"] = conflicting_memory_id
+                            action_metadata["conflict_type"] = resp.get("conflict_type", "unknown")
+                            action_metadata["conflict_resolved"] = False
+                            task = asyncio.create_task(
+                                self._create_memory(data=action_text, existing_embeddings=new_message_embeddings, metadata=action_metadata)
+                            )
+                            memory_tasks.append((task, resp, "CONFLICT_FLAGGED", None))
                     elif event_type == "UPDATE":
                         task = asyncio.create_task(
                             self._update_memory(
@@ -1615,7 +2204,23 @@ class AsyncMemory(MemoryBase):
                 try:
                     result_id = await task
                     if event_type == "ADD":
-                        returned_memories.append({"id": result_id, "memory": resp.get("text"), "event": event_type})
+                        add_result = {"id": result_id, "memory": resp.get("text"), "event": event_type}
+                        if resp.get("text") and trust_scores_map:
+                            add_result["trust_score"] = trust_scores_map.get(resp.get("text"))
+                        returned_memories.append(add_result)
+                    elif event_type in ("CONFLICT_RESOLVED", "CONFLICT_FLAGGED"):
+                        conflict_result = {
+                            "id": result_id,
+                            "memory": resp.get("text"),
+                            "event": event_type,
+                            "previous_memory": resp.get("old_memory"),
+                            "conflict_type": resp.get("conflict_type"),
+                        }
+                        if event_type == "CONFLICT_RESOLVED":
+                            conflict_result["superseded_id"] = temp_uuid_mapping.get(resp.get("id"))
+                        else:
+                            conflict_result["conflict_with"] = temp_uuid_mapping.get(resp.get("id"))
+                        returned_memories.append(conflict_result)
                     elif event_type == "UPDATE":
                         returned_memories.append(
                             {
@@ -1651,6 +2256,35 @@ class AsyncMemory(MemoryBase):
 
         return added_entities
 
+    def _score_facts(self, facts: list) -> Dict[str, float]:
+        """
+        Use LLM to score each extracted fact for trust/importance.
+
+        Args:
+            facts: List of fact strings to score.
+
+        Returns:
+            Dict mapping fact text → trust score (0.0-1.0).
+        """
+        trust_cfg = self.config.trust_scoring
+        prompt_template = trust_cfg.scoring_prompt or TRUST_SCORING_PROMPT
+        facts_text = "\n".join(f"- {f}" for f in facts)
+        prompt = prompt_template.format(facts=facts_text)
+        try:
+            response = self.llm.generate_response(
+                messages=[
+                    {"role": "system", "content": "You are an expert memory evaluator."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+            response = remove_code_blocks(response)
+            scored = json.loads(response).get("scored_facts", [])
+            return {item["text"]: float(item["score"]) for item in scored if "text" in item and "score" in item}
+        except Exception as e:
+            logger.warning(f"Trust scoring failed, using default scores: {e}")
+            return {f: 0.5 for f in facts}
+
     async def get(self, memory_id):
         """
         Retrieve a memory by ID asynchronously.
@@ -1674,7 +2308,8 @@ class AsyncMemory(MemoryBase):
             "role",
         ]
 
-        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", *promoted_payload_keys}
+        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id",
+                                  "trust_score", "memory_tier", *promoted_payload_keys}
 
         result_item = MemoryItem(
             id=memory.id,
@@ -1682,6 +2317,8 @@ class AsyncMemory(MemoryBase):
             hash=memory.payload.get("hash"),
             created_at=memory.payload.get("created_at"),
             updated_at=memory.payload.get("updated_at"),
+            trust_score=memory.payload.get("trust_score"),
+            memory_tier=memory.payload.get("memory_tier"),
         ).model_dump()
 
         for key in promoted_payload_keys:
@@ -1780,7 +2417,8 @@ class AsyncMemory(MemoryBase):
             "actor_id",
             "role",
         ]
-        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", *promoted_payload_keys}
+        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id",
+                                  "trust_score", "memory_tier", *promoted_payload_keys}
 
         formatted_memories = []
         for mem in actual_memories:
@@ -1790,6 +2428,8 @@ class AsyncMemory(MemoryBase):
                 hash=mem.payload.get("hash"),
                 created_at=mem.payload.get("created_at"),
                 updated_at=mem.payload.get("updated_at"),
+                trust_score=mem.payload.get("trust_score"),
+                memory_tier=mem.payload.get("memory_tier"),
             ).model_dump(exclude={"score"})
 
             for key in promoted_payload_keys:
@@ -2021,7 +2661,10 @@ class AsyncMemory(MemoryBase):
             "role",
         ]
 
-        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", *promoted_payload_keys}
+        core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id",
+                                  "expires_at", "access_count", "last_accessed_at",
+                                  "trust_score", "memory_tier",
+                                  *promoted_payload_keys}
 
         original_memories = []
         for mem in memories:
@@ -2032,6 +2675,8 @@ class AsyncMemory(MemoryBase):
                 created_at=mem.payload.get("created_at"),
                 updated_at=mem.payload.get("updated_at"),
                 score=mem.score,
+                trust_score=mem.payload.get("trust_score"),
+                memory_tier=mem.payload.get("memory_tier"),
             ).model_dump()
 
             for key in promoted_payload_keys:
@@ -2145,6 +2790,36 @@ class AsyncMemory(MemoryBase):
         metadata["data"] = data
         metadata["hash"] = hashlib.md5(data.encode()).hexdigest()
         metadata["created_at"] = datetime.now(pytz.timezone("US/Pacific")).isoformat()
+
+        # ── Hierarchical Memory: assign tier if not already set ──
+        hier_cfg = self.config.hierarchical_memory
+        if hier_cfg.enabled and "memory_tier" not in metadata:
+            if metadata.get("run_id"):
+                metadata["memory_tier"] = MemoryTier.WORKING.value
+            elif metadata.get("agent_id"):
+                metadata["memory_tier"] = MemoryTier.SESSION.value
+            else:
+                metadata["memory_tier"] = MemoryTier.LONG_TERM.value
+
+        # ── TTL: stamp expiration if configured and not already set ──
+        ttl_cfg = self.config.cleanup.ttl
+        if ttl_cfg.enabled and "expires_at" not in metadata and ttl_cfg.default_ttl_seconds is not None:
+            metadata["expires_at"] = compute_expires_at(ttl_cfg.default_ttl_seconds)
+
+        # ── Proactive Forgetting: apply tier-based TTL ──
+        pf_cfg = self.config.cleanup.proactive_forgetting
+        if pf_cfg.enabled and "expires_at" not in metadata:
+            tier = metadata.get("memory_tier")
+            if tier:
+                tier_expires = compute_tier_ttl(tier, pf_cfg.tier_ttl_seconds)
+                if tier_expires:
+                    metadata["expires_at"] = tier_expires
+
+        # ── GC: initialise access tracking fields ──
+        gc_cfg = self.config.cleanup.garbage_collection
+        if gc_cfg.enabled:
+            metadata.setdefault("access_count", 0)
+            metadata.setdefault("last_accessed_at", metadata["created_at"])
 
         await asyncio.to_thread(
             self.vector_store.insert,

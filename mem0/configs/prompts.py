@@ -457,3 +457,120 @@ def get_update_memory_messages(retrieved_old_memory_dict, response_content, cust
 
     Do not return anything except the JSON format.
     """
+
+
+TRUST_SCORING_PROMPT = """You are an expert memory evaluator. Your task is to assess the importance and long-term value of each extracted fact on a scale from 0.0 to 1.0.
+
+Scoring criteria:
+- **Personal relevance** (0.3 weight): How specific and personally meaningful is this fact? Names, preferences, relationships score high. Generic observations score low.
+- **Actionability** (0.25 weight): Can this fact be used to personalize future interactions? Preferences and plans score high. Trivia scores low.
+- **Uniqueness** (0.25 weight): Is this information distinctive and not easily re-derivable? Unique details score high. Common knowledge scores low.
+- **Long-term value** (0.2 weight): Will this fact still be relevant weeks or months from now? Core identity/preferences score high. Momentary states score low.
+
+Score guidelines:
+- 0.0-0.2: Trivial, ephemeral, or noise (e.g., "I just sneezed", "The weather is nice")
+- 0.2-0.4: Low value, situational (e.g., "Having coffee right now", "Waiting for a bus")
+- 0.4-0.6: Moderate value, contextual (e.g., "Working on a report today", "Meeting with team at 3pm")
+- 0.6-0.8: High value, durable (e.g., "Prefers Python over Java", "Works as a data scientist")
+- 0.8-1.0: Core identity/critical (e.g., "Name is Alice", "Has a peanut allergy", "Married to Bob")
+
+You will receive a list of extracted facts. Return a JSON object with scored facts:
+
+{{"scored_facts": [{{"text": "fact text here", "score": 0.75}}, ...]}}
+
+Facts to score:
+{facts}
+"""
+
+
+CONFLICT_AWARE_UPDATE_MEMORY_PROMPT = """You are a smart memory manager which controls the memory of a system.
+You can perform five operations: (1) add into the memory, (2) update the memory, (3) delete from the memory, (4) no change, and (5) flag a conflict.
+
+Based on the above five operations, the memory will change.
+
+Compare newly retrieved facts with the existing memory. For each new fact, decide whether to:
+- ADD: Add it to the memory as a new element
+- UPDATE: Update an existing memory element (when new info supplements or refines old info)
+- DELETE: Delete an existing memory element
+- NONE: Make no change (if the fact is already present or irrelevant)
+- CONFLICT: Flag when a new fact directly contradicts an existing memory (e.g., preference changed, factual disagreement). This is different from UPDATE — use CONFLICT when the old and new information cannot both be true simultaneously.
+
+Guidelines for CONFLICT detection:
+- Preference changes: "Likes Python" vs "Prefers Rust now" → CONFLICT (not UPDATE)
+- Factual contradictions: "Lives in NYC" vs "Moved to SF" → CONFLICT (not UPDATE)
+- Supplementary info: "Likes pizza" vs "Likes cheese pizza" → UPDATE (not CONFLICT)
+- Unrelated info: "Likes pizza" vs "Works as engineer" → ADD (separate facts)
+
+There are specific guidelines to select which operation to perform:
+
+1. **Add**: If the retrieved facts contain new information not present in the memory, add it with a new ID.
+2. **Update**: If new info supplements or refines existing memory without contradiction, update it (keep same ID).
+3. **Delete**: If the direction is to explicitly delete a memory.
+4. **No Change**: If the fact is already present in memory.
+5. **Conflict**: If the new fact contradicts existing memory. Include both the old and new information.
+
+For CONFLICT events, include additional fields:
+- "old_memory": the existing memory text that conflicts
+- "conflict_type": one of "preference_change", "factual_update", "correction"
+"""
+
+
+def get_conflict_aware_update_memory_messages(
+    retrieved_old_memory_dict, response_content, custom_update_memory_prompt=None
+):
+    """Build prompt for conflict-aware memory update decisions."""
+    if custom_update_memory_prompt is None:
+        prompt = CONFLICT_AWARE_UPDATE_MEMORY_PROMPT
+    else:
+        prompt = custom_update_memory_prompt
+
+    if retrieved_old_memory_dict:
+        current_memory_part = f"""
+    Below is the current content of my memory which I have collected till now. You have to update it in the following format only:
+
+    ```
+    {retrieved_old_memory_dict}
+    ```
+
+    """
+    else:
+        current_memory_part = """
+    Current memory is empty.
+
+    """
+
+    return f"""{prompt}
+
+    {current_memory_part}
+
+    The new retrieved facts are mentioned in the triple backticks. You have to analyze the new retrieved facts and determine whether these facts should be added, updated, deleted, or flagged as conflicts in the memory.
+
+    ```
+    {response_content}
+    ```
+
+    You must return your response in the following JSON structure only:
+
+    {{
+        "memory" : [
+            {{
+                "id" : "<ID of the memory>",
+                "text" : "<Content of the memory>",
+                "event" : "<Operation to be performed>",
+                "old_memory" : "<Old memory content>",
+                "conflict_type" : "<Type of conflict>"
+            }},
+            ...
+        ]
+    }}
+
+    Follow the instruction mentioned below:
+    - Do not return anything from the custom few shot prompts provided above.
+    - If the current memory is empty, then you have to add the new retrieved facts to the memory.
+    - You should return the updated memory in only JSON format as shown below.
+    - The "event" field must be one of: "ADD", "UPDATE", "DELETE", "NONE", or "CONFLICT".
+    - For "CONFLICT" events, include "old_memory" and "conflict_type" fields.
+    - For "UPDATE" events, include "old_memory" field.
+
+    Do not return anything except the JSON format.
+    """
