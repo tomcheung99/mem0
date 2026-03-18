@@ -1,0 +1,90 @@
+name: Notify Discord on Update
+
+on:
+  push:
+    branches: [main, master, develop, 'feature/**']
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Get event summary
+        id: diff
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "type=push" >> "$GITHUB_OUTPUT"
+            echo "title=${{ github.event.head_commit.message }}" >> "$GITHUB_OUTPUT"
+            echo "url=${{ github.event.head_commit.url }}" >> "$GITHUB_OUTPUT"
+            echo "author=${{ github.event.head_commit.author.name }}" >> "$GITHUB_OUTPUT"
+
+            if [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+              files=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | head -20 | paste -sd ', ' -)
+            else
+              files=$(git show --pretty='' --name-only "${{ github.sha }}" | head -20 | paste -sd ', ' -)
+            fi
+
+            if [ -z "$files" ]; then
+              files="No files detected"
+            fi
+
+            echo "files=$files" >> "$GITHUB_OUTPUT"
+          else
+            pr_state="pr_${{ github.event.action }}"
+            if [ "${{ github.event.pull_request.merged }}" = "true" ]; then
+              pr_state="pr_merged"
+            elif [ "${{ github.event.action }}" = "closed" ]; then
+              pr_state="pr_closed"
+            fi
+
+            echo "type=$pr_state" >> "$GITHUB_OUTPUT"
+            echo "title=PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}" >> "$GITHUB_OUTPUT"
+            echo "url=${{ github.event.pull_request.html_url }}" >> "$GITHUB_OUTPUT"
+            echo "author=${{ github.event.pull_request.user.login }}" >> "$GITHUB_OUTPUT"
+            echo "files=See PR for details" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send to Discord
+        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          TYPE: ${{ steps.diff.outputs.type }}
+          COMMIT_SHA: ${{ github.sha }}
+          MESSAGE_TITLE: ${{ steps.diff.outputs.title }}
+          FILES_CHANGED: ${{ steps.diff.outputs.files }}
+          AUTHOR_NAME: ${{ steps.diff.outputs.author || github.actor }}
+          EVENT_URL: ${{ steps.diff.outputs.url }}
+        shell: bash
+        run: |
+          python3 <<'PY' > "$RUNNER_TEMP/discord_payload.json"
+          import json
+          import os
+
+          lines = [
+              "[REPO_UPDATE]",
+              f"Repo: {os.environ['REPOSITORY']}",
+              f"Branch: {os.environ['BRANCH']}",
+              f"Type: {os.environ['TYPE']}",
+              f"Commit: {os.environ['COMMIT_SHA']}",
+              f"Message: {os.environ['MESSAGE_TITLE']}",
+              f"Files: {os.environ['FILES_CHANGED']}",
+              f"Author: {os.environ['AUTHOR_NAME']}",
+              f"URL: {os.environ['EVENT_URL']}",
+          ]
+
+          print(json.dumps({"content": "\n".join(lines)}))
+          PY
+
+          curl -fsSL \
+            -H "Content-Type: application/json" \
+            --data @"$RUNNER_TEMP/discord_payload.json" \
+            "$DISCORD_WEBHOOK"
