@@ -374,6 +374,373 @@ async def search_memory(query: str) -> str:
         return f"Error searching memory: {e}"
 
 
+@mcp.tool(
+    description=(
+        "Search memories scoped to a specific project or app (e.g. 'my React project', 'Claude Desktop'). "
+        "Use this when the user asks about memories related to a particular tool, codebase, or application. "
+        "Combines project-level filtering with semantic vector matching so results are both relevant "
+        "and limited to that project context."
+    )
+)
+async def search_by_project(query: str, project_name: str, limit: int = 10) -> str:
+    """Search memories filtered by project/app name with semantic vector matching."""
+    uid = user_id_var.get(None)
+    client_name = client_name_var.get(None)
+    logging.info(
+        "MCP search_by_project called user_id=%s client_name=%s project=%s",
+        uid, client_name, project_name,
+    )
+    if not uid:
+        return "Error: user_id not provided"
+    if not client_name:
+        return "Error: client_name not provided"
+
+    memory_client = get_memory_client_safe()
+    if not memory_client:
+        return "Error: Memory system is currently unavailable. Please try again later."
+
+    try:
+        db = SessionLocal()
+        try:
+            from app.models import App
+            user, _caller_app = get_user_and_app(db, user_id=uid, app_id=client_name)
+
+            # Resolve the target project app by name (case-insensitive)
+            target_app = (
+                db.query(App)
+                .filter(
+                    App.owner_id == user.id,
+                    App.name.ilike(project_name),
+                )
+                .first()
+            )
+            if not target_app:
+                return json.dumps({"results": [], "message": f"No project named '{project_name}' found."})
+
+            # Collect accessible memory IDs for the target project
+            from app.models import Memory as MemoryModel
+            project_memories = (
+                db.query(MemoryModel)
+                .filter(
+                    MemoryModel.user_id == user.id,
+                    MemoryModel.app_id == target_app.id,
+                    MemoryModel.state == MemoryState.active,
+                )
+                .all()
+            )
+            accessible_ids = {
+                m.id
+                for m in project_memories
+                if check_memory_access_permissions(db, m, _caller_app.id)
+            }
+
+            if not accessible_ids:
+                return json.dumps({"results": [], "message": f"No accessible memories in project '{project_name}'."})
+
+            # Semantic search restricted to this user
+            embeddings = memory_client.embedding_model.embed(query, "search")
+            hits = memory_client.vector_store.search(
+                query=query,
+                vectors=embeddings,
+                limit=100,
+                filters={"user_id": uid},
+            )
+
+            # Filter to project-only memories
+            results = []
+            for h in hits:
+                if uuid.UUID(str(h.id)) not in accessible_ids:
+                    continue
+                results.append({
+                    "id": h.id,
+                    "memory": h.payload.get("data"),
+                    "score": h.score,
+                    "created_at": h.payload.get("created_at"),
+                    "updated_at": h.payload.get("updated_at"),
+                })
+
+            # Rerank if available, else take top-N by score
+            if hasattr(memory_client, "reranker") and memory_client.reranker and results:
+                try:
+                    results = memory_client.reranker.rerank(query, results, top_k=limit)
+                except Exception as rerank_err:
+                    logging.warning("Reranking failed: %s", rerank_err)
+                    results = results[:limit]
+            else:
+                results = results[:limit]
+
+            # Log access
+            for r in results:
+                if r.get("id"):
+                    db.add(MemoryAccessLog(
+                        memory_id=uuid.UUID(str(r["id"])),
+                        app_id=_caller_app.id,
+                        access_type="search_by_project",
+                        metadata_={"query": query, "project": project_name, "score": r.get("score")},
+                    ))
+            db.commit()
+
+            return json.dumps({"project": project_name, "results": results}, indent=2)
+        finally:
+            db.close()
+    except Exception as e:
+        logging.exception(e)
+        return f"Error searching by project: {e}"
+
+
+@mcp.tool(
+    description=(
+        "List the most recent memory sessions sorted by time. "
+        "Each 'session' is a group of memories added within a short window. "
+        "Use this when the user asks 'what did we discuss recently', 'show me the last few sessions', "
+        "or needs a chronological overview of recent memory activity. "
+        "Returns the last `limit` sessions (default 10) with their memories."
+    )
+)
+async def list_recent_sessions(limit: int = 10) -> str:
+    """Return memories grouped into recent sessions, sorted newest-first."""
+    uid = user_id_var.get(None)
+    client_name = client_name_var.get(None)
+    logging.info(
+        "MCP list_recent_sessions called user_id=%s client_name=%s limit=%d",
+        uid, client_name, limit,
+    )
+    if not uid:
+        return "Error: user_id not provided"
+    if not client_name:
+        return "Error: client_name not provided"
+
+    try:
+        db = SessionLocal()
+        try:
+            from app.models import App, Memory as MemoryModel
+            user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
+
+            # Fetch recent active memories sorted newest-first
+            # Session boundary: memories within 30 min of each other belong to the same session
+            SESSION_GAP_MINUTES = 30
+            MAX_FETCH = limit * 20  # fetch enough to form `limit` sessions
+
+            recent_memories = (
+                db.query(MemoryModel)
+                .filter(
+                    MemoryModel.user_id == user.id,
+                    MemoryModel.state == MemoryState.active,
+                )
+                .order_by(MemoryModel.created_at.desc())
+                .limit(MAX_FETCH)
+                .all()
+            )
+
+            # ACL filter
+            accessible = [
+                m for m in recent_memories
+                if check_memory_access_permissions(db, m, app.id)
+            ]
+
+            # Group into sessions by 30-min gap
+            sessions: list[dict] = []
+            current_session: dict | None = None
+
+            for mem in accessible:
+                mem_time = mem.created_at
+                if mem_time.tzinfo is None:
+                    mem_time = mem_time.replace(tzinfo=datetime.timezone.utc)
+
+                if current_session is None:
+                    current_session = {
+                        "session_start": mem_time.isoformat(),
+                        "session_end": mem_time.isoformat(),
+                        "memories": [],
+                    }
+
+                last_time_str = current_session["session_end"]
+                last_time = datetime.datetime.fromisoformat(last_time_str)
+                if last_time.tzinfo is None:
+                    last_time = last_time.replace(tzinfo=datetime.timezone.utc)
+
+                gap = abs((mem_time - last_time).total_seconds()) / 60
+                if gap > SESSION_GAP_MINUTES and current_session["memories"]:
+                    sessions.append(current_session)
+                    if len(sessions) >= limit:
+                        break
+                    current_session = {
+                        "session_start": mem_time.isoformat(),
+                        "session_end": mem_time.isoformat(),
+                        "memories": [],
+                    }
+
+                # Resolve app name for display
+                app_obj = db.query(App).filter(App.id == mem.app_id).first()
+                current_session["memories"].append({
+                    "id": str(mem.id),
+                    "content": mem.content,
+                    "app": app_obj.name if app_obj else None,
+                    "created_at": mem_time.isoformat(),
+                })
+                current_session["session_end"] = mem_time.isoformat()
+
+            if current_session and current_session["memories"] and len(sessions) < limit:
+                sessions.append(current_session)
+
+            # Log access for all returned memories
+            for session in sessions:
+                for m in session["memories"]:
+                    db.add(MemoryAccessLog(
+                        memory_id=uuid.UUID(m["id"]),
+                        app_id=app.id,
+                        access_type="list_recent_sessions",
+                        metadata_={"limit": limit},
+                    ))
+            db.commit()
+
+            return json.dumps(
+                {"total_sessions": len(sessions), "sessions": sessions},
+                indent=2,
+            )
+        finally:
+            db.close()
+    except Exception as e:
+        logging.exception(e)
+        return f"Error listing recent sessions: {e}"
+
+
+@mcp.tool(
+    description=(
+        "Save a summary of the current conversation session to long-term memory. "
+        "Call this tool at the END of a conversation — when the user says goodbye, "
+        "closes the topic, or explicitly asks to wrap up. "
+        "Pass a concise but complete summary of what was discussed, decided, or learned. "
+        "This prevents memory fragmentation by storing one coherent session record "
+        "instead of many scattered facts. "
+        "Example summary: 'Discussed migrating the API from Express to FastAPI. "
+        "Decided to keep JWT auth. Next step: write migration plan for /users route.'"
+    )
+)
+async def save_session_summary(summary: str, project: str | None = None) -> str:
+    """Store a session-level summary as a single cohesive memory entry.
+
+    Args:
+        summary: A concise narrative of the whole session — what was discussed,
+                 decisions made, open questions, and next steps.
+        project: Optional project/app name to tag this summary under (e.g. 'my-react-app').
+                 If omitted, uses the current client name.
+    """
+    uid = user_id_var.get(None)
+    client_name = client_name_var.get(None)
+    logging.info(
+        "MCP save_session_summary called user_id=%s client_name=%s project=%s",
+        uid, client_name, project,
+    )
+    if not uid:
+        return "Error: user_id not provided"
+    if not client_name:
+        return "Error: client_name not provided"
+    if not summary or not summary.strip():
+        return "Error: summary must not be empty"
+
+    memory_client = get_memory_client_safe()
+    if not memory_client:
+        return "Error: Memory system is currently unavailable. Please try again later."
+
+    try:
+        db = SessionLocal()
+        try:
+            from app.models import App
+            user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
+
+            if not app.is_active:
+                return f"Error: App {app.name} is currently paused. Cannot save session summary."
+
+            # Resolve target app for tagging — use project name if provided
+            target_app = app
+            if project and project != client_name:
+                project_app = (
+                    db.query(App)
+                    .filter(App.owner_id == user.id, App.name.ilike(project))
+                    .first()
+                )
+                if project_app:
+                    target_app = project_app
+
+            # Wrap the summary with session metadata so mem0 stores it as one unit
+            session_date = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+            tagged_summary = (
+                f"[Session Summary — {session_date}"
+                f"{f', project: {target_app.name}' if target_app else ''}] "
+                f"{summary.strip()}"
+            )
+
+            merged_metadata = {
+                "source_app": "openmemory",
+                "mcp_client": client_name,
+                "memory_type": "session_summary",
+                "session_date": session_date,
+                "project": target_app.name if target_app else client_name,
+            }
+
+            # infer=False: store verbatim without LLM re-extraction so the
+            # full session context is preserved as a single memory, not split
+            # into atomic facts.
+            response = memory_client.add(
+                tagged_summary,
+                user_id=uid,
+                metadata=merged_metadata,
+                infer=False,
+            )
+
+            # Sync to PostgreSQL
+            affected: list = []
+            if isinstance(response, dict) and "results" in response:
+                for result in response["results"]:
+                    event = result.get("event")
+                    if event not in ("ADD", "UPDATE"):
+                        continue
+                    memory_id = uuid.UUID(result["id"])
+                    existing = db.query(Memory).filter(Memory.id == memory_id).first()
+                    if event == "ADD":
+                        if existing:
+                            existing.content = result["memory"]
+                            existing.state = MemoryState.active
+                            mem_obj = existing
+                        else:
+                            mem_obj = Memory(
+                                id=memory_id,
+                                user_id=user.id,
+                                app_id=target_app.id,
+                                content=result["memory"],
+                                metadata_=merged_metadata,
+                                state=MemoryState.active,
+                            )
+                            db.add(mem_obj)
+                        db.add(MemoryStatusHistory(
+                            memory_id=memory_id,
+                            changed_by=user.id,
+                            old_state=MemoryState.deleted,
+                            new_state=MemoryState.active,
+                        ))
+                        affected.append(memory_id)
+                    elif event == "UPDATE" and existing:
+                        existing.content = result["memory"]
+                        affected.append(memory_id)
+
+            if affected:
+                db.commit()
+
+            logging.info("save_session_summary: stored %d memory entries", len(affected))
+            return json.dumps({
+                "status": "ok",
+                "stored": len(affected),
+                "project": target_app.name if target_app else client_name,
+                "session_date": session_date,
+            })
+        finally:
+            db.close()
+    except Exception as e:
+        logging.exception(e)
+        return f"Error saving session summary: {e}"
+
+
 # Backend-only: not exposed as MCP tool, managed via OpenMemory UI/API
 async def list_memories() -> str:
     uid = user_id_var.get(None)
