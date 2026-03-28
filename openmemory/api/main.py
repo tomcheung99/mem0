@@ -101,6 +101,9 @@ def initialize_database_state():
     set_database_state(False, None, status="initializing", stage="create-tables")
     Base.metadata.create_all(bind=engine)
 
+    # Ensure columns added after initial table creation exist (idempotent)
+    _apply_schema_updates()
+
     logging.info("Database tables verified")
     set_database_state(False, None, status="initializing", stage="create-default-user")
     create_default_user()
@@ -111,6 +114,41 @@ def initialize_database_state():
 
     set_database_state(True, None, status="ready", stage="complete")
     logging.info("Database state initialized")
+
+
+def _apply_schema_updates():
+    """Add columns that may be missing on an existing database.
+
+    Uses ``ADD COLUMN IF NOT EXISTS`` (PostgreSQL) or inspects first
+    (SQLite / others) so the call is always idempotent.
+    """
+    _columns = [
+        ("memories", "access_count", "INTEGER DEFAULT 0"),
+        ("memories", "last_accessed", "TIMESTAMP"),
+    ]
+
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        for table, column, col_type in _columns:
+            if dialect == "postgresql":
+                conn.execute(text(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_type}"
+                ))
+            else:
+                # SQLite / others: check information_schema or pragma
+                try:
+                    conn.execute(text(f"SELECT {column} FROM {table} LIMIT 0"))
+                except Exception:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"))
+
+    # Index (PostgreSQL only, idempotent via IF NOT EXISTS)
+    if dialect == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_memory_last_accessed ON memories (last_accessed)"
+            ))
+
+    logging.info("Schema updates applied (checked %d columns)", len(_columns))
 
 
 async def initialize_database_with_retry(app: FastAPI, max_attempts: int = 10, delay_seconds: int = 5):
