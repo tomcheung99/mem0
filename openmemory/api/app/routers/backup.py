@@ -1,4 +1,5 @@
-from datetime import UTC, datetime
+from datetime import datetime, timezone as _tz
+UTC = _tz.utc
 import io 
 import json 
 import gzip 

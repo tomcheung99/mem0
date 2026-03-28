@@ -215,6 +215,7 @@ async def add_memories(text: str, metadata: dict | None = None) -> str:
                                          metadata=merged_metadata)
 
             # Process the response and update database
+            conflict_results = []
             if isinstance(response, dict) and 'results' in response:
                 for result in response['results']:
                     memory_id = uuid.UUID(result['id'])
@@ -274,6 +275,26 @@ async def add_memories(text: str, metadata: dict | None = None) -> str:
                             db.add(history)
 
                 db.commit()
+
+                # Run real-time conflict detection on newly added/updated memories
+                from app.utils.conflict_detection import check_and_resolve_conflicts
+                for result in response['results']:
+                    if result['event'] in ('ADD', 'UPDATE'):
+                        mem_id = uuid.UUID(result['id'])
+                        mem_obj = db.query(Memory).filter(Memory.id == mem_id).first()
+                        if mem_obj:
+                            conflicts = check_and_resolve_conflicts(
+                                new_memory=mem_obj,
+                                user=user,
+                                db=db,
+                                memory_client=memory_client,
+                            )
+                            conflict_results.extend(conflicts)
+
+            # Append conflict info to response if any
+            if conflict_results:
+                if isinstance(response, dict):
+                    response["conflicts"] = conflict_results
 
             return json.dumps(response)
         finally:
@@ -365,6 +386,10 @@ async def search_memory(query: str) -> str:
                     )
                     db.add(access_log)
             db.commit()
+
+            # Bump access_count / last_accessed for decay tracking
+            from app.utils.access_tracking import bump_access
+            bump_access(db, [r["id"] for r in results if r.get("id")])
 
             return json.dumps({"results": results}, indent=2)
         finally:
@@ -479,6 +504,10 @@ async def search_by_project(query: str, project_name: str, limit: int = 10) -> s
                         metadata_={"query": query, "project": project_name, "score": r.get("score")},
                     ))
             db.commit()
+
+            # Bump access_count / last_accessed for decay tracking
+            from app.utils.access_tracking import bump_access
+            bump_access(db, [r["id"] for r in results if r.get("id")])
 
             return json.dumps({"project": project_name, "results": results}, indent=2)
         finally:

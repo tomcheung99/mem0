@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session, relationship
 
 def get_current_utc_time():
     """Get current UTC time"""
-    return datetime.datetime.now(datetime.UTC)
+    return datetime.datetime.now(datetime.timezone.utc)
 
 
 class MemoryState(enum.Enum):
@@ -99,6 +99,8 @@ class Memory(Base):
                         onupdate=get_current_utc_time)
     archived_at = Column(DateTime, nullable=True, index=True)
     deleted_at = Column(DateTime, nullable=True, index=True)
+    access_count = Column(Integer, default=0, nullable=False, server_default="0")
+    last_accessed = Column(DateTime, nullable=True, index=True)
 
     user = relationship("User", back_populates="memories")
     app = relationship("App", back_populates="memories")
@@ -108,6 +110,7 @@ class Memory(Base):
         Index('idx_memory_user_state', 'user_id', 'state'),
         Index('idx_memory_app_state', 'app_id', 'state'),
         Index('idx_memory_user_app', 'user_id', 'app_id'),
+        Index('idx_memory_last_accessed', 'last_accessed'),
     )
 
 
@@ -116,7 +119,7 @@ class Category(Base):
     id = Column(UUID, primary_key=True, default=lambda: uuid.uuid4())
     name = Column(String, unique=True, nullable=False, index=True)
     description = Column(String)
-    created_at = Column(DateTime, default=datetime.datetime.now(datetime.UTC), index=True)
+    created_at = Column(DateTime, default=datetime.datetime.now(datetime.timezone.utc), index=True)
     updated_at = Column(DateTime,
                         default=get_current_utc_time,
                         onupdate=get_current_utc_time)

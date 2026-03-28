@@ -1,5 +1,6 @@
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone as _tz
+UTC = _tz.utc
 from typing import List, Optional, Set
 from uuid import UUID
 
@@ -327,7 +328,28 @@ async def create_memory(
                 db.commit()
                 for memory in affected_memories:
                     db.refresh(memory)
-                return affected_memories[0]
+
+                # Run real-time conflict detection on newly added/updated memories
+                from app.utils.conflict_detection import check_and_resolve_conflicts
+                conflict_results = []
+                for memory in affected_memories:
+                    conflicts = check_and_resolve_conflicts(
+                        new_memory=memory,
+                        user=user,
+                        db=db,
+                        memory_client=memory_client,
+                    )
+                    conflict_results.extend(conflicts)
+
+                result = affected_memories[0]
+                if conflict_results:
+                    return {
+                        "id": result.id,
+                        "content": result.content,
+                        "state": result.state.value if result.state else None,
+                        "conflicts": conflict_results,
+                    }
+                return result
 
             # NOOP / all events skipped — return the most recent memory for this user/app
             fallback = (
@@ -591,6 +613,11 @@ async def search_memories(
             limit=request.limit,
         )
         results = memory_client.search(**search_kwargs)
+
+        # Bump access_count / last_accessed for decay tracking
+        from app.utils.access_tracking import bump_access
+        _hits = results.get("results", results) if isinstance(results, dict) else results
+        bump_access(db, [r.get("id") for r in _hits if r.get("id")])
 
         # Optionally filter by metadata on the returned results
         if request.metadata_filter:

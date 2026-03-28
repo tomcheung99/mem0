@@ -17,9 +17,13 @@ from sqlalchemy import text
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.utils.scheduler import start_consolidation_scheduler, stop_consolidation_scheduler
+
     async with get_streamable_manager().run():
         asyncio.create_task(initialize_database_with_retry(app))
+        start_consolidation_scheduler()
         yield
+        stop_consolidation_scheduler()
 
 
 app = FastAPI(title="OpenMemory API", lifespan=lifespan)
