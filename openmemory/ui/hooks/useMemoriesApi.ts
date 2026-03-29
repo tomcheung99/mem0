@@ -3,7 +3,8 @@ import axios from 'axios';
 import { Memory, Client, Category } from '@/components/types';
 import { useDispatch, useSelector } from 'react-redux';
 import { AppDispatch, RootState } from '@/store/store';
-import { setAccessLogs, setMemoriesSuccess, setSelectedMemory, setRelatedMemories } from '@/store/memoriesSlice';
+import { setAccessLogs, setMemoriesSuccess, setSelectedMemory, setRelatedMemories, setVersionHistory } from '@/store/memoriesSlice';
+import { VersionHistoryEntry } from '@/store/memoriesSlice';
 
 // Define the new simplified memory type
 export interface SimpleMemory {
@@ -49,6 +50,13 @@ interface AccessLogResponse {
   logs: AccessLogEntry[];
 }
 
+interface VersionHistoryResponse {
+  total: number;
+  page: number;
+  page_size: number;
+  versions: VersionHistoryEntry[];
+}
+
 interface RelatedMemoryItem {
   id: string;
   content: string;
@@ -83,6 +91,7 @@ interface UseMemoriesApiReturn {
   ) => Promise<{ memories: Memory[]; total: number; pages: number }>;
   fetchMemoryById: (memoryId: string) => Promise<void>;
   fetchAccessLogs: (memoryId: string, page?: number, pageSize?: number) => Promise<void>;
+  fetchVersionHistory: (memoryId: string, page?: number, pageSize?: number) => Promise<void>;
   fetchRelatedMemories: (memoryId: string) => Promise<void>;
   createMemory: (text: string) => Promise<void>;
   deleteMemories: (memoryIds: string[]) => Promise<void>;
@@ -232,6 +241,26 @@ export const useMemoriesApi = (): UseMemoriesApiReturn => {
     }
   };
 
+  const fetchVersionHistory = async (memoryId: string, page: number = 1, pageSize: number = 20): Promise<void> => {
+    if (memoryId === "") {
+      return;
+    }
+    setIsLoading(true);
+    setError(null);
+    try {
+      const response = await axios.get<VersionHistoryResponse>(
+        `${URL}/api/v1/memories/${memoryId}/versions?page=${page}&page_size=${pageSize}`
+      );
+      setIsLoading(false);
+      dispatch(setVersionHistory(response.data.versions));
+    } catch (err: any) {
+      const errorMessage = err.message || 'Failed to fetch version history';
+      setError(errorMessage);
+      setIsLoading(false);
+      throw new Error(errorMessage);
+    }
+  };
+
   const fetchRelatedMemories = async (memoryId: string): Promise<void> => {
     if (memoryId === "") {
       return;
@@ -330,6 +359,7 @@ export const useMemoriesApi = (): UseMemoriesApiReturn => {
     fetchMemories,
     fetchMemoryById,
     fetchAccessLogs,
+    fetchVersionHistory,
     fetchRelatedMemories,
     createMemory,
     deleteMemories,

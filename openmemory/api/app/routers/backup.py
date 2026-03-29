@@ -342,9 +342,14 @@ async def import_backup(
         # Same-user collision + overwrite mode: treat import as ground truth
         if existing and (existing.user_id == user.id) and mode == "overwrite": 
             incoming_state = m.get("state", "active")
+            _old = existing.content
+            _new = m.get("content") or ""
             existing.user_id = user.id 
             existing.app_id = default_app.id
-            existing.content = m.get("content") or ""
+            existing.content = _new
+            if _old != _new:
+                from app.utils.versioning import record_version
+                record_version(db, existing, _old, _new, "restore", changed_by=user.id)
             existing.metadata_ = m.get("metadata") or {}
             try: 
                 existing.state = MemoryState(incoming_state)

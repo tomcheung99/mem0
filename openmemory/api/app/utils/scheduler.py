@@ -319,8 +319,13 @@ def _dedup_user(user, db, memory_client) -> int:
                 continue
 
             # Update keeper content
+            _old = mem.content
             mem.content = decision.merged_content
             mem.updated_at = datetime.datetime.now(datetime.timezone.utc)
+
+            # Record version snapshot
+            from app.utils.versioning import record_version
+            record_version(db, mem, _old, decision.merged_content, "dedup", changed_by=user.id)
 
             # Re-embed the keeper in vector store
             try:

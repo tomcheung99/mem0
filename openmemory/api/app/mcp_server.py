@@ -27,6 +27,7 @@ from app.models import Memory, MemoryAccessLog, MemoryState, MemoryStatusHistory
 from app.utils.db import get_user_and_app
 from app.utils.memory import get_memory_client
 from app.utils.permissions import check_memory_access_permissions
+from app.utils.versioning import record_version
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, status
 from fastapi.routing import APIRouter
@@ -233,8 +234,10 @@ async def add_memories(text: str, metadata: dict | None = None) -> str:
                             )
                             db.add(memory)
                         else:
+                            _old = memory.content
                             memory.state = MemoryState.pending
                             memory.content = result['memory']
+                            record_version(db, memory, _old, result['memory'], "add_overwrite", changed_by=user.id)
 
                         # Create history entry
                         history = MemoryStatusHistory(
@@ -248,7 +251,9 @@ async def add_memories(text: str, metadata: dict | None = None) -> str:
                     elif result['event'] == 'UPDATE':
                         old_state = memory.state if memory else None
                         if memory:
+                            _old = memory.content
                             memory.content = result['memory']
+                            record_version(db, memory, _old, result['memory'], "update", changed_by=user.id)
                             memory.state = MemoryState.pending
                             if metadata:
                                 memory.metadata_ = {**(memory.metadata_ or {}), **metadata}
@@ -729,8 +734,10 @@ async def save_session_summary(summary: str, project: str | None = None) -> str:
                     existing = db.query(Memory).filter(Memory.id == memory_id).first()
                     if event == "ADD":
                         if existing:
+                            _old = existing.content
                             existing.content = result["memory"]
                             existing.state = MemoryState.active
+                            record_version(db, existing, _old, result["memory"], "add_overwrite", changed_by=user.id)
                             mem_obj = existing
                         else:
                             mem_obj = Memory(
@@ -750,7 +757,9 @@ async def save_session_summary(summary: str, project: str | None = None) -> str:
                         ))
                         affected.append(memory_id)
                     elif event == "UPDATE" and existing:
+                        _old = existing.content
                         existing.content = result["memory"]
+                        record_version(db, existing, _old, result["memory"], "update", changed_by=user.id)
                         affected.append(memory_id)
 
             if affected:
@@ -965,6 +974,7 @@ def update_memory(memory_id: str, new_content: str) -> str:
             # Update SQL
             memory.content = new_content
             memory.updated_at = datetime.datetime.now(datetime.UTC)
+            record_version(db, memory, old_content, new_content, "update", changed_by=user.id)
             db.commit()
 
             # Access log

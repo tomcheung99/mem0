@@ -192,6 +192,25 @@ class MemoryAccessLog(Base):
         Index('idx_access_app_time', 'app_id', 'accessed_at'),
     )
 
+
+class MemoryVersion(Base):
+    """Immutable snapshot of a memory's content before each mutation."""
+    __tablename__ = "memory_versions"
+    id = Column(UUID, primary_key=True, default=lambda: uuid.uuid4())
+    memory_id = Column(UUID, ForeignKey("memories.id"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    old_content = Column(String, nullable=False)
+    new_content = Column(String, nullable=False)
+    change_type = Column(String, nullable=False, index=True)  # "update", "merge", "dedup", "add_overwrite", "restore"
+    changed_by = Column(UUID, ForeignKey("users.id"), nullable=True, index=True)
+    created_at = Column(DateTime, default=get_current_utc_time, index=True)
+
+    memory = relationship("Memory", backref="versions")
+
+    __table_args__ = (
+        Index('idx_version_memory_version', 'memory_id', 'version'),
+    )
+
 def categorize_memory(memory: Memory, db: Session) -> None:
     """Categorize a memory using OpenAI and store the categories in the database."""
     try:

@@ -8,11 +8,21 @@ interface AccessLogEntry {
   accessed_at: string;
 }
 
+export interface VersionHistoryEntry {
+  id: string;
+  version: number;
+  old_content: string | null;
+  new_content: string;
+  change_type: string;
+  created_at: string | null;
+}
+
 // Define the shape of the memories state
 interface MemoriesState {
   memories: Memory[];
   selectedMemory: SimpleMemory | null;
   accessLogs: AccessLogEntry[];
+  versionHistory: VersionHistoryEntry[];
   relatedMemories: Memory[];
   status: 'idle' | 'loading' | 'succeeded' | 'failed';
   error: string | null;
@@ -23,6 +33,7 @@ const initialState: MemoriesState = {
   memories: [],
   selectedMemory: null,
   accessLogs: [],
+  versionHistory: [],
   relatedMemories: [],
   status: 'idle',
   error: null,
@@ -76,6 +87,9 @@ const memoriesSlice = createSlice({
     clearSelection: (state) => {
       state.selectedMemoryIds = [];
     },
+    setVersionHistory: (state, action: PayloadAction<VersionHistoryEntry[]>) => {
+      state.versionHistory = action.payload;
+    },
     setRelatedMemories: (state, action: PayloadAction<Memory[]>) => {
       state.relatedMemories = action.payload;
     },
@@ -94,6 +108,7 @@ export const {
   clearSelection,
   setSelectedMemory,
   setAccessLogs,
+  setVersionHistory,
   setRelatedMemories
 } = memoriesSlice.actions;
 

@@ -252,6 +252,10 @@ def _do_merge(
     active_memory.content = merged_content
     active_memory.updated_at = datetime.datetime.now(datetime.UTC)
 
+    # Record version snapshot
+    from app.utils.versioning import record_version
+    record_version(db, active_memory, old_content, merged_content, "merge", changed_by=user.id)
+
     # Re-embed in vector store
     try:
         memory_client.update(str(active_id), merged_content)

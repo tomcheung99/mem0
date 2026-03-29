@@ -17,6 +17,7 @@ from app.models import (
 )
 from app.schemas import MemoryResponse
 from app.utils.memory import get_memory_client
+from app.utils.versioning import record_version
 from app.utils.permissions import check_memory_access_permissions
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi_pagination import Page, Params
@@ -297,8 +298,10 @@ async def create_memory(
 
                 if event == 'ADD':
                     if existing_memory:
+                        _old = existing_memory.content
                         existing_memory.state = MemoryState.active
                         existing_memory.content = result['memory']
+                        record_version(db, existing_memory, _old, result['memory'], "add_overwrite", changed_by=user.id)
                         memory = existing_memory
                     else:
                         memory = Memory(
@@ -320,7 +323,9 @@ async def create_memory(
                     affected_memories.append(memory)
 
                 elif event == 'UPDATE' and existing_memory:
+                    _old = existing_memory.content
                     existing_memory.content = result['memory']
+                    record_version(db, existing_memory, _old, result['memory'], "update", changed_by=user.id)
                     affected_memories.append(existing_memory)
 
             # Commit all changes at once
@@ -552,6 +557,44 @@ async def get_memory_access_log(
     }
 
 
+@router.get("/{memory_id}/versions")
+async def get_memory_versions(
+    memory_id: UUID,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db)
+):
+    """Return the content version history for a single memory, newest first."""
+    from app.models import MemoryVersion
+    get_memory_or_404(db, memory_id)
+
+    query = db.query(MemoryVersion).filter(MemoryVersion.memory_id == memory_id)
+    total = query.count()
+    versions = (
+        query.order_by(MemoryVersion.version.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "versions": [
+            {
+                "id": str(v.id),
+                "version": v.version,
+                "old_content": v.old_content,
+                "new_content": v.new_content,
+                "change_type": v.change_type,
+                "created_at": v.created_at.isoformat() if v.created_at else None,
+            }
+            for v in versions
+        ],
+    }
+
+
 class UpdateMemoryRequest(BaseModel):
     memory_content: str
     user_id: str
@@ -576,7 +619,9 @@ async def update_memory(
     except Exception as e:
         logging.warning(f"Vector store update failed for {memory_id}, SQL will still update: {e}")
 
+    _old = memory.content
     memory.content = request.memory_content
+    record_version(db, memory, _old, request.memory_content, "update", changed_by=user.id)
     db.commit()
     db.refresh(memory)
     return memory
