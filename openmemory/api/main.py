@@ -12,6 +12,7 @@ from app.models import App, User
 from app.routers import apps_router, backup_router, config_router, memories_router, stats_router
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
 from fastapi_pagination import add_pagination
 from sqlalchemy import text
 
@@ -206,3 +207,14 @@ add_pagination(app)
 # This intercepts /mcp/{client}/http/{user} BEFORE FastAPI routing,
 # so it is immune to FastAPI's internal route compilation.
 app = StreamableHTTPMiddleware(app)
+
+# Wrap CORS as the OUTERMOST layer so MCP streamable HTTP requests
+# (which bypass FastAPI routing via StreamableHTTPMiddleware) also
+# receive CORS headers and proper OPTIONS preflight handling.
+app = StarletteCORSMiddleware(
+    app,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=ALLOW_CREDENTIALS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
