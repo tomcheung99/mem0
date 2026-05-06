@@ -145,6 +145,10 @@ class OpenAILLM(LLMBase):
                     "response_format rejected by endpoint, retrying without it: %s", e
                 )
                 params.pop("response_format", None)
+                # Without structured output, JSON responses may be longer;
+                # raise the token budget to reduce truncation risk.
+                if params.get("max_tokens", 0) < 4000:
+                    params["max_tokens"] = 4000
                 response = self.client.chat.completions.create(**params)
             else:
                 raise
